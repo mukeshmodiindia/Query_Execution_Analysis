@@ -2,7 +2,7 @@ VERSION_PROFILES = {
     "MongoDB": {
         "6.0": {
             "supports": ["queryPlanner", "executionStats", "allPlansExecution"],
-            "notes": "Explain modes available. executionStats and allPlansExecution can add measurable overhead.",
+            "notes": "Explain modes are available through db.collection.explain(). Higher verbosity modes can add measurable overhead.",
             "docs": "https://www.mongodb.com/docs/v6.0/reference/method/db.collection.explain/",
         },
         "7.0": {
@@ -12,7 +12,7 @@ VERSION_PROFILES = {
         },
         "8.0": {
             "supports": ["queryPlanner", "executionStats", "allPlansExecution"],
-            "notes": "Planner output and optimizer behavior may differ from 6.x/7.x; always validate in target environment.",
+            "notes": "Planner output and optimizer behavior may differ from 6.x/7.x; validate plans in the exact production version.",
             "docs": "https://www.mongodb.com/docs/v8.0/reference/method/db.collection.explain/",
         },
     },
@@ -24,7 +24,7 @@ VERSION_PROFILES = {
         },
         "8.0": {
             "supports": ["EXPLAIN", "EXPLAIN ANALYZE", "EXPLAIN FORMAT=JSON"],
-            "notes": "EXPLAIN ANALYZE executes the query and returns actual timing metrics.",
+            "notes": "EXPLAIN ANALYZE executes the statement (8.0.18+) and returns runtime metrics; use cautiously on write queries.",
             "docs": "https://dev.mysql.com/doc/refman/8.0/en/explain.html",
         },
     },
@@ -35,17 +35,17 @@ VERSION_PROFILES = {
             "docs": "https://www.postgresql.org/docs/12/sql-explain.html",
         },
         "13": {
-            "supports": ["EXPLAIN", "EXPLAIN (ANALYZE, BUFFERS)"],
-            "notes": "Planner and statistics behavior can differ by release.",
+            "supports": ["EXPLAIN", "EXPLAIN (ANALYZE, BUFFERS)", "EXPLAIN (ANALYZE, BUFFERS, WAL)"],
+            "notes": "WAL usage can be inspected with EXPLAIN WAL in modern releases.",
             "docs": "https://www.postgresql.org/docs/13/sql-explain.html",
         },
         "14": {
-            "supports": ["EXPLAIN", "EXPLAIN (ANALYZE, BUFFERS)"],
+            "supports": ["EXPLAIN", "EXPLAIN (ANALYZE, BUFFERS)", "EXPLAIN (ANALYZE, BUFFERS, WAL)"],
             "notes": "Runtime node instrumentation continues to evolve.",
             "docs": "https://www.postgresql.org/docs/14/sql-explain.html",
         },
         "15": {
-            "supports": ["EXPLAIN", "EXPLAIN (ANALYZE, BUFFERS)"],
+            "supports": ["EXPLAIN", "EXPLAIN (ANALYZE, BUFFERS)", "EXPLAIN (ANALYZE, BUFFERS, WAL)"],
             "notes": "Check planner changes if comparing with older environments.",
             "docs": "https://www.postgresql.org/docs/15/sql-explain.html",
         },
