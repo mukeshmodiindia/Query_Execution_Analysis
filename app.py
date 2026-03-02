@@ -14,6 +14,32 @@ st.set_page_config(page_title="Query Execution Analysis", layout="wide")
 
 MAX_LOG_FILES = 20
 
+
+def _query_shape_hints(db_type: str, query_text: str) -> list[str]:
+    hints: list[str] = []
+    q = query_text.lower()
+
+    if db_type == "MongoDB":
+        if "$or" in q:
+            hints.append("`$or` heavy filters often benefit from separate supporting indexes per branch.")
+        if "$regex" in q:
+            hints.append("Regex predicates can bypass index selectivity unless left-anchored; review if an alternate query shape is possible.")
+        if "sort" in q:
+            hints.append("If sort latency is high, consider a compound index that aligns filter fields followed by sort keys.")
+        if "aggregate" in q or "$group" in q:
+            hints.append("Aggregation pipelines should push selective `$match` stages as early as possible to reduce scanned documents.")
+    else:
+        if "select *" in q:
+            hints.append("Avoid `SELECT *` on hot paths; projecting only required columns can reduce I/O and memory.")
+        if " order by " in q and " limit " not in q:
+            hints.append("`ORDER BY` without `LIMIT` can force large sorts; consider pagination and index support for the sort order.")
+        if " like '%" in q:
+            hints.append("Leading-wildcard LIKE patterns are rarely index-friendly; consider full-text search or query rewrites.")
+        if " join " in q:
+            hints.append("For join-heavy queries, ensure join keys are indexed on both sides and validate row estimates in the plan.")
+
+    return hints
+
 st.title("Query Execution Analysis Dashboard")
 st.caption("Top query review from logs with version-aware explain plan guidance.")
 
@@ -189,6 +215,10 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
             st.plotly_chart(fig_line, use_container_width=True)
 
         st.markdown("#### Explain Plan Guidance")
+        st.markdown(
+            "Before final tuning recommendations, confirm whether supporting indexes already exist "
+            "for this query shape and share a few representative sample documents/rows."
+        )
 
         sample_originals = Counter(df[df["normalized_query"] == query_text]["query"]).most_common(3)
         with st.expander(f"Representative raw queries for query #{rank}"):
@@ -228,3 +258,30 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
             st.write(
                 "Inspect full scan indicators, estimated vs actual rows, index usage, and high-cost plan nodes."
             )
+
+        st.markdown("#### Index & Sample Data Checklist")
+        if db_type == "MongoDB":
+            st.code("db.<collection>.getIndexes()", language="javascript")
+            st.code("db.<collection>.find(<filter>).limit(5)", language="javascript")
+            st.markdown(
+                "Share: existing index list, estimated document count/cardinality for filtered fields, and 5 sample documents."
+            )
+        elif db_type == "MySQL":
+            st.code("SHOW INDEX FROM <table>;", language="sql")
+            st.code("SELECT * FROM <table> WHERE <same_predicate> LIMIT 5;", language="sql")
+            st.markdown(
+                "Share: current indexes, table row count estimate, and 5 sample rows for columns used in WHERE/JOIN/ORDER BY."
+            )
+        else:
+            st.code("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = '<schema>' AND tablename = '<table>';", language="sql")
+            st.code("SELECT * FROM <schema>.<table> WHERE <same_predicate> LIMIT 5;", language="sql")
+            st.markdown(
+                "Share: index definitions, table statistics freshness (ANALYZE status), and 5 sample rows for key predicates."
+            )
+
+        shape_hints = _query_shape_hints(db_type, query_text)
+        if shape_hints:
+            st.markdown("#### Query Shape Suggestions")
+            for hint in shape_hints:
+                st.write(f"- {hint}")
+
