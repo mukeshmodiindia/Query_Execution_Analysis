@@ -12,6 +12,8 @@ from src.version_profiles import VERSION_PROFILES
 
 st.set_page_config(page_title="Query Execution Analysis", layout="wide")
 
+MAX_LOG_FILES = 20
+
 st.title("Query Execution Analysis Dashboard")
 st.caption("Top query review from logs with version-aware explain plan guidance.")
 
@@ -36,12 +38,28 @@ if db_type == "MongoDB" and explain_mode == "allPlansExecution":
         "Run carefully in production and verify index strategy before/after testing."
     )
 
-uploaded = st.file_uploader("Upload log file", type=["log", "txt", "json"])
+uploaded = st.file_uploader(
+    "Upload log files",
+    type=["log", "txt", "json"],
+    accept_multiple_files=True,
+    help=f"Upload up to {MAX_LOG_FILES} files in one run.",
+)
 manual_text = st.text_area("Or paste log content", height=180)
 
 raw_text = ""
-if uploaded is not None:
-    raw_text = uploaded.getvalue().decode("utf-8", errors="ignore")
+if uploaded:
+    if len(uploaded) > MAX_LOG_FILES:
+        st.error(f"You uploaded {len(uploaded)} files. The limit is {MAX_LOG_FILES} files per run.")
+        st.stop()
+
+    parts = [f.getvalue().decode("utf-8", errors="ignore") for f in uploaded]
+    raw_text = "\n".join(parts)
+
+    total_size_mb = sum(getattr(f, "size", 0) for f in uploaded) / (1024 * 1024)
+    st.caption(
+        f"Loaded {len(uploaded)} file(s), combined size: {total_size_mb:,.2f} MB. "
+        "For very large files, split uploads or pre-filter logs for better responsiveness."
+    )
 elif manual_text.strip():
     raw_text = manual_text
 
