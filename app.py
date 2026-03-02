@@ -113,72 +113,100 @@ with right:
 
 st.dataframe(agg.head(50), use_container_width=True)
 
-st.subheader("Highest-Time Query Analysis Based on Occurrence")
+st.subheader("Detailed Query Analysis")
 min_occ = st.slider("Minimum occurrences", 1, int(max(1, agg["occurrences"].max())), 2)
+analysis_limit = st.slider("Number of top queries to analyze", 1, 50, 10)
 frequent = agg[agg["occurrences"] >= min_occ]
 if frequent.empty:
     st.warning("No query meets selected minimum occurrences.")
     st.stop()
 
-selected = frequent.sort_values("total_duration_ms", ascending=False).iloc[0]
-query_text = selected["normalized_query"]
-st.code(query_text, language="sql")
+ranked = frequent.sort_values(["total_duration_ms", "occurrences"], ascending=[False, False]).head(
+    analysis_limit
+)
+if ranked.empty:
+    st.warning("No query available for detailed analysis.")
+    st.stop()
+
+page_size = 5
+total_queries = len(ranked)
+total_pages = max(1, (total_queries + page_size - 1) // page_size)
+page = st.number_input("Analysis page", min_value=1, max_value=total_pages, value=1, step=1)
+start_idx = (page - 1) * page_size
+end_idx = min(start_idx + page_size, total_queries)
+page_queries = ranked.iloc[start_idx:end_idx]
+
 st.write(
-    f"Occurrences: **{int(selected['occurrences'])}**, "
-    f"Total duration: **{selected['total_duration_ms']:.2f} ms**, "
-    f"Average: **{selected['avg_duration_ms']:.2f} ms**"
+    f"Showing detailed analysis for queries **{start_idx + 1}–{end_idx}** of "
+    f"**{total_queries}** (page {page}/{total_pages})."
 )
 
-query_df = df[df["normalized_query"] == query_text].copy()
-fig_hist = px.histogram(query_df, x="duration_ms", nbins=20, title="Duration distribution (ms)")
-st.plotly_chart(fig_hist, use_container_width=True)
+for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 1):
+    query_text = selected["normalized_query"]
+    with st.container(border=True):
+        st.markdown(f"### #{rank} Query")
+        st.code(query_text, language="sql")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Occurrences", int(selected["occurrences"]))
+        m2.metric("Total duration (ms)", f"{selected['total_duration_ms']:.2f}")
+        m3.metric("Average duration (ms)", f"{selected['avg_duration_ms']:.2f}")
 
-if query_df["timestamp"].notna().any():
-    timeline = query_df.dropna(subset=["timestamp"]).sort_values("timestamp")
-    fig_line = px.line(timeline, x="timestamp", y="duration_ms", title="Latency timeline")
-    st.plotly_chart(fig_line, use_container_width=True)
-
-st.subheader("Explain Plan Guidance")
-
-sample_originals = Counter(df[df["normalized_query"] == query_text]["query"]).most_common(3)
-with st.expander("Representative raw queries"):
-    for q, c in sample_originals:
-        st.write(f"Count: {c}")
-        st.code(q)
-
-if db_type == "MongoDB":
-    st.markdown("**Run in Mongo shell / mongosh**")
-    mongo_placeholder = {
-        "find": "<collection>",
-        "filter": {"<field>": "<value>"},
-    }
-    mode_for_call = explain_mode if explain_mode != "queryPlanner" else None
-    if mode_for_call:
-        st.code(
-            f"db.<collection>.explain('{mode_for_call}').find(<filter>)",
-            language="javascript",
+        query_df = df[df["normalized_query"] == query_text].copy()
+        fig_hist = px.histogram(
+            query_df,
+            x="duration_ms",
+            nbins=20,
+            title=f"Duration distribution for query #{rank} (ms)",
         )
-    else:
-        st.code("db.<collection>.explain().find(<filter>)", language="javascript")
-    st.write("Expected output fields to inspect:")
-    st.json(
-        {
-            "winningPlan": "Check COLLSCAN vs IXSCAN",
-            "executionStats.totalDocsExamined": "High docs examined indicates missing/inefficient index",
-            "executionStats.totalKeysExamined": "Compare with docs examined",
-            "executionStats.executionTimeMillis": "Correlate with log latency",
-            "allPlansExecution": "Review rejected plans, index candidates, and score trade-offs",
-        }
-    )
-else:
-    if db_type == "MySQL":
-        cmd = (
-            "EXPLAIN ANALYZE " if explain_mode == "EXPLAIN ANALYZE" else "EXPLAIN "
-        )
-        st.code(f"{cmd}<your_query>;", language="sql")
-    elif db_type == "PostgreSQL":
-        st.code(f"{explain_mode} <your_query>;", language="sql")
+        st.plotly_chart(fig_hist, use_container_width=True)
 
-    st.write(
-        "Inspect full scan indicators, estimated vs actual rows, index usage, and high-cost plan nodes."
-    )
+        if query_df["timestamp"].notna().any():
+            timeline = query_df.dropna(subset=["timestamp"]).sort_values("timestamp")
+            fig_line = px.line(
+                timeline,
+                x="timestamp",
+                y="duration_ms",
+                title=f"Latency timeline for query #{rank}",
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
+
+        st.markdown("#### Explain Plan Guidance")
+
+        sample_originals = Counter(df[df["normalized_query"] == query_text]["query"]).most_common(3)
+        with st.expander(f"Representative raw queries for query #{rank}"):
+            for q, c in sample_originals:
+                st.write(f"Count: {c}")
+                st.code(q)
+
+        if db_type == "MongoDB":
+            st.markdown("**Run in Mongo shell / mongosh**")
+            mode_for_call = explain_mode if explain_mode != "queryPlanner" else None
+            if mode_for_call:
+                st.code(
+                    f"db.<collection>.explain('{mode_for_call}').find(<filter>)",
+                    language="javascript",
+                )
+            else:
+                st.code("db.<collection>.explain().find(<filter>)", language="javascript")
+            st.write("Expected output fields to inspect:")
+            st.json(
+                {
+                    "winningPlan": "Check COLLSCAN vs IXSCAN",
+                    "executionStats.totalDocsExamined": "High docs examined indicates missing/inefficient index",
+                    "executionStats.totalKeysExamined": "Compare with docs examined",
+                    "executionStats.executionTimeMillis": "Correlate with log latency",
+                    "allPlansExecution": "Review rejected plans, index candidates, and score trade-offs",
+                }
+            )
+        else:
+            if db_type == "MySQL":
+                cmd = (
+                    "EXPLAIN ANALYZE " if explain_mode == "EXPLAIN ANALYZE" else "EXPLAIN "
+                )
+                st.code(f"{cmd}<your_query>;", language="sql")
+            elif db_type == "PostgreSQL":
+                st.code(f"{explain_mode} <your_query>;", language="sql")
+
+            st.write(
+                "Inspect full scan indicators, estimated vs actual rows, index usage, and high-cost plan nodes."
+            )
