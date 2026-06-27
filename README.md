@@ -8,12 +8,15 @@ A Streamlit dashboard that reviews top queries from database logs, then analyzes
 - PostgreSQL (v12, v13, v14, v15, v16 profiles)
 
 ## Features
-- Upload one or multiple logs and parse query events per database type.
+- Upload one or multiple logs from either:
+  - the Streamlit browser uploader/paste box
+  - the command prompt with `upload_logs.py`, then review the batch in the UI
 - Top query review by:
   - total duration
   - average duration
   - occurrence count
-- Detailed view for the highest-time query among frequently occurring queries.
+- Detailed view for frequently occurring high-time query shapes.
+- Index and query rewrite suggestions for MongoDB, MySQL, and PostgreSQL query shapes.
 - Explain-plan simulation workflow:
   - MongoDB `explain()` (`queryPlanner`)
   - MongoDB `explain('executionStats')`
@@ -45,6 +48,28 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Upload logs from command prompt
+
+Use the CLI uploader when logs are on the server/VM and you want the analysis to appear in the Streamlit UI.
+
+```bash
+python upload_logs.py --db MongoDB --version 8.0 --label prod-mongo-logs /var/log/mongodb/mongod.log
+python upload_logs.py --db MySQL --version 8.0 --label mysql-slow /var/log/mysql/mysql-slow.log
+python upload_logs.py --db PostgreSQL --version 16 --label postgres-duration /var/log/postgresql/postgresql.log
+```
+
+Then open or refresh Streamlit and choose **Command-line uploads** as the log source.
+
+By default, parsed batches are stored under `.query_analysis_uploads/`. To share a different location between the CLI and UI, set `QUERY_ANALYSIS_UPLOAD_DIR` before running both commands:
+
+```bash
+export QUERY_ANALYSIS_UPLOAD_DIR=/data/query-analysis-uploads
+python upload_logs.py --db MongoDB --version 8.0 --label nightly samples/mongodb_sample.log
+streamlit run app.py
+```
+
+The CLI stores parsed query events and a manifest. It does not execute queries against MongoDB, MySQL, or PostgreSQL.
+
 ## OS and package requirements
 
 ### Supported OS
@@ -66,8 +91,10 @@ python3 -m venv .venv
 ```
 
 ### Python packages
+Use Python 3.10+ for current Streamlit compatibility.
+
 Python dependencies are listed in `requirements.txt`:
-- `streamlit>=1.34.0`
+- `streamlit>=1.58.0`
 - `pandas>=2.0.0`
 - `plotly>=5.20.0`
 
