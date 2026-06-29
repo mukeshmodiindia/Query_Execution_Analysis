@@ -41,8 +41,24 @@ For large datasets (for example 10 files × 2 GB each), process logs in batches 
 
 ## Quick start (local)
 
+On Ubuntu/Debian, install the Python venv package before creating `.venv`:
+
 ```bash
-python -m venv .venv
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip
+```
+
+If `python3 -m venv .venv` reports that `ensurepip` is unavailable, install the
+venv package for your exact Python version, for example:
+
+```bash
+sudo apt install -y python3.12-venv
+```
+
+Then create and activate the environment:
+
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
