@@ -16,8 +16,12 @@ class QueryEvent:
     source_line: Optional[str] = None
 
 
-def _safe_parse_ts(value: str | None) -> Optional[datetime]:
+def _safe_parse_ts(value: Any) -> Optional[datetime]:
     if not value:
+        return None
+    if isinstance(value, dict):
+        value = value.get("$date") or value.get("date")
+    if not isinstance(value, str):
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -41,6 +45,151 @@ def _nested_get(doc: dict[str, Any], path: list[str]) -> Any:
     return current
 
 
+def _first_value(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _duration_ms(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        match = re.search(r"\d+(?:\.\d+)?", value)
+        if match:
+            return float(match.group(0))
+    return None
+
+
+def _mongo_command_namespace(command: Any) -> Optional[str]:
+    if not isinstance(command, dict):
+        return None
+
+    db_name = command.get("$db") or command.get("db")
+    collection = _first_value(
+        command.get("find"),
+        command.get("aggregate"),
+        command.get("count"),
+        command.get("distinct"),
+        command.get("insert"),
+        command.get("update"),
+        command.get("delete"),
+        command.get("findAndModify"),
+        command.get("findandmodify"),
+        command.get("collection"),
+    )
+    if db_name and isinstance(collection, str):
+        return f"{db_name}.{collection}"
+    return None
+
+
+def _format_mongo_query(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True)
+    if isinstance(value, list):
+        return json.dumps(value, sort_keys=True)
+    if isinstance(value, str):
+        clean = value.strip()
+        return clean or None
+    return None
+
+
+def _mongo_query_from_container(container: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    command = container.get("command")
+    originating_command = container.get("originatingCommand")
+
+    candidates: list[Any] = []
+    if isinstance(command, dict) and "getMore" in command and originating_command is not None:
+        candidates.extend([originating_command, command])
+    else:
+        candidates.extend([command, originating_command])
+    candidates.extend(
+        [
+            container.get("query"),
+            container.get("filter"),
+            container.get("pipeline"),
+        ]
+    )
+
+    for candidate in candidates:
+        query = _format_mongo_query(candidate)
+        if query:
+            return query, _mongo_command_namespace(candidate)
+    return None, None
+
+
+def _extract_balanced_braces(text: str, start: int) -> Optional[str]:
+    depth = 0
+    in_string = False
+    quote_char = ""
+    escaped = False
+
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote_char:
+                in_string = False
+            continue
+
+        if char in {"'", '"'}:
+            in_string = True
+            quote_char = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _parse_mongodb_text_log(raw: str) -> tuple[Optional[float], Optional[str], Optional[str]]:
+    duration_match = re.search(
+        r"\b(?:durationMillis|duration|millis)\s*[:=]\s*(\d+(?:\.\d+)?)\s*(?:ms)?\b",
+        raw,
+        re.IGNORECASE,
+    )
+    duration = float(duration_match.group(1)) if duration_match else None
+    if duration is None:
+        trailing_ms = re.findall(r"\b(\d+(?:\.\d+)?)ms\b", raw, flags=re.IGNORECASE)
+        if trailing_ms:
+            duration = float(trailing_ms[-1])
+
+    ns = None
+    ns_match = re.search(r"\bns\s*[:=]\s*\"?([^\"\s,]+)", raw)
+    if ns_match:
+        ns = ns_match.group(1)
+    else:
+        ns_match = re.search(
+            r"\b(?:command|query|getmore|update|remove|delete)\s+([A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+)\b",
+            raw,
+            re.IGNORECASE,
+        )
+        if ns_match:
+            ns = ns_match.group(1)
+
+    query = None
+    for marker in ("originatingCommand", "command", "query", "filter"):
+        marker_match = re.search(rf"\b{marker}\s*[:=]", raw, re.IGNORECASE)
+        if not marker_match:
+            continue
+        brace_start = raw.find("{", marker_match.end())
+        if brace_start == -1:
+            continue
+        query = _extract_balanced_braces(raw, brace_start)
+        if query:
+            break
+
+    return duration, ns, query
+
+
 def parse_mongodb_logs(text: str) -> List[QueryEvent]:
     events: List[QueryEvent] = []
     for line in text.splitlines():
@@ -55,32 +204,27 @@ def parse_mongodb_logs(text: str) -> List[QueryEvent]:
         try:
             doc = json.loads(raw)
             attr = doc.get("attr") if isinstance(doc.get("attr"), dict) else {}
-            duration = doc.get("durationMillis") or attr.get("durationMillis")
-            ns = doc.get("ns") or attr.get("ns")
+            duration = _duration_ms(
+                _first_value(
+                    doc.get("durationMillis"),
+                    attr.get("durationMillis"),
+                    doc.get("millis"),
+                    attr.get("millis"),
+                )
+            )
             ts = _safe_parse_ts(
                 doc.get("ts")
                 or _nested_get(doc, ["t", "$date"])
                 or attr.get("ts")
                 or _nested_get(attr, ["t", "$date"])
             )
-            command = doc.get("command") or attr.get("command")
-            if command is not None:
-                query = json.dumps(command, sort_keys=True)
-            elif "query" in doc:
-                query = str(doc["query"])
-            elif "query" in attr:
-                query = str(attr["query"])
+            query, command_ns = _mongo_query_from_container(attr)
+            if query is None:
+                query, command_ns = _mongo_query_from_container(doc)
+            ns = _first_value(doc.get("ns"), attr.get("ns"), command_ns)
         except json.JSONDecodeError:
             # Try line-oriented MongoDB log pattern fallback.
-            dur_match = re.search(r"(durationMillis|ms):\s*(\d+(?:\.\d+)?)", raw)
-            if dur_match:
-                duration = float(dur_match.group(2))
-            ns_match = re.search(r"\bns\s*[:=]\s*([^\s,]+)", raw)
-            if ns_match:
-                ns = ns_match.group(1)
-            query_match = re.search(r"(?:command|query)\s*[:=]\s*(\{.*\})", raw)
-            if query_match:
-                query = query_match.group(1)
+            duration, ns, query = _parse_mongodb_text_log(raw)
 
         if duration is None or query is None:
             continue
