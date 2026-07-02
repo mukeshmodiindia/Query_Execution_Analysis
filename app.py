@@ -7,6 +7,17 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from src.logging_config import configure_logging
+from src.mongo_indexes import (
+    MongoIndex,
+    duplicate_index_rows,
+    mongo_index_rows,
+    parse_mongo_indexes,
+    redundant_index_rows,
+    review_row,
+    review_suggested_index,
+    suggested_index_from_example,
+)
 from src.parsers import normalize_query, parser_for
 from src.recommendations import recommendations_for_query
 from src.storage import list_upload_batches, load_upload_events
@@ -16,6 +27,7 @@ from src.version_profiles import VERSION_PROFILES
 st.set_page_config(page_title="Query Execution Analysis", layout="wide")
 
 MAX_LOG_FILES = 20
+LOGGER = configure_logging(__name__)
 
 
 def _batch_label(manifest: dict[str, Any]) -> str:
@@ -30,6 +42,12 @@ def _batch_label(manifest: dict[str, Any]) -> str:
 def _browser_upload_rows(db_type: str, raw_text: str) -> list[dict[str, Any]]:
     parse = parser_for(db_type)
     events = parse(raw_text)
+    LOGGER.info(
+        "browser_upload_parsed db_type=%s parsed_events=%s input_bytes=%s",
+        db_type,
+        len(events),
+        len(raw_text.encode("utf-8", errors="ignore")),
+    )
     rows: list[dict[str, Any]] = []
     for event in events:
         rows.append(
@@ -79,14 +97,66 @@ def _explain_language(db_type: str) -> str:
     return "javascript" if db_type == "MongoDB" else "sql"
 
 
+def _render_mongodb_existing_indexes() -> list[MongoIndex]:
+    with st.expander("Share MongoDB Indexes"):
+        st.caption("Can you share the current collection indexes? Paste `getIndexes()` JSON output here for more accurate suggestions.")
+        st.code(
+            'JSON.stringify(db.getCollection("<collection>").getIndexes())',
+            language="javascript",
+        )
+        raw_indexes = st.text_area(
+            "Paste getIndexes() JSON output",
+            height=160,
+            help="Optional. Share current collection indexes so suggestions can be marked as already existing, covered, or new.",
+            placeholder='[{"name":"status_1_customerId_1","key":{"status":1,"customerId":1}}]',
+        )
+
+        if not raw_indexes.strip():
+            return []
+
+        try:
+            existing_indexes = parse_mongo_indexes(raw_indexes)
+        except ValueError as exc:
+            LOGGER.warning("mongo_index_parse_failed error=%s", exc)
+            st.error(str(exc))
+            return []
+
+        index_rows = mongo_index_rows(existing_indexes)
+        if index_rows:
+            st.dataframe(pd.DataFrame(index_rows), width="stretch")
+
+        duplicates = duplicate_index_rows(existing_indexes)
+        if duplicates:
+            st.warning("Duplicate existing indexes found.")
+            st.dataframe(pd.DataFrame(duplicates), width="stretch")
+
+        redundant = redundant_index_rows(existing_indexes)
+        if redundant:
+            st.warning("Potentially redundant existing indexes found.")
+            st.dataframe(pd.DataFrame(redundant), width="stretch")
+
+        LOGGER.info(
+            "mongo_indexes_loaded index_count=%s duplicate_groups=%s redundant_candidates=%s",
+            len(existing_indexes),
+            len(duplicates),
+            len(redundant),
+        )
+        return existing_indexes
+
+
 st.title("Query Execution Analysis Dashboard")
 st.caption("Upload logs from the command prompt or browser, then review slow query shapes and tuning suggestions in the UI.")
+
+if "query_analysis_session_logged" not in st.session_state:
+    LOGGER.info("streamlit_session_started")
+    st.session_state["query_analysis_session_logged"] = True
 
 source = st.radio(
     "Log source",
     ["Command-line uploads", "Browser upload or paste"],
     horizontal=True,
 )
+LOGGER.info("streamlit_source_selected source=%s", source)
 
 rows: list[dict[str, Any]] = []
 selected_manifest: Optional[dict[str, Any]] = None
@@ -94,6 +164,7 @@ selected_manifest: Optional[dict[str, Any]] = None
 if source == "Command-line uploads":
     batches = list_upload_batches()
     if not batches:
+        LOGGER.info("command_line_uploads_empty")
         st.info(
             "No command-line uploads were found yet. Run a command like "
             "`python upload_logs.py --db MongoDB --version 8.0 samples/mongodb_sample.log`, "
@@ -127,6 +198,13 @@ if source == "Command-line uploads":
         st.json(selected_manifest)
 
     rows = load_upload_events(selected_batch_id)
+    LOGGER.info(
+        "command_line_upload_selected batch_id=%s db_type=%s db_version=%s rows=%s",
+        selected_batch_id,
+        db_type,
+        db_version,
+        len(rows),
+    )
 else:
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -157,6 +235,13 @@ else:
         raw_text = "\n".join(parts)
 
         total_size_mb = sum(getattr(file, "size", 0) for file in uploaded) / (1024 * 1024)
+        LOGGER.info(
+            "browser_files_loaded file_count=%s combined_size_mb=%.2f db_type=%s db_version=%s",
+            len(uploaded),
+            total_size_mb,
+            db_type,
+            db_version,
+        )
         st.caption(
             f"Loaded {len(uploaded)} file(s), combined size: {total_size_mb:,.2f} MB. "
             "For very large files, use the command-line uploader or pre-filter logs for better responsiveness."
@@ -173,6 +258,7 @@ else:
 _render_profile(db_type, db_version, explain_mode)
 
 if not rows:
+    LOGGER.warning("no_query_events_parsed db_type=%s db_version=%s source=%s", db_type, db_version, source)
     st.error("No query events were parsed. Check your log format and selected database.")
     st.stop()
 
@@ -189,6 +275,14 @@ agg = (
         max_duration_ms=("duration_ms", "max"),
     )
     .sort_values(["total_duration_ms", "occurrences"], ascending=[False, False])
+)
+LOGGER.info(
+    "analysis_ready db_type=%s db_version=%s rows=%s unique_query_count=%s total_duration_ms=%.2f",
+    db_type,
+    db_version,
+    len(df),
+    len(agg),
+    df["duration_ms"].sum(),
 )
 
 st.subheader("Top Query Review")
@@ -224,6 +318,10 @@ with right:
     st.plotly_chart(fig_occ, width="stretch")
 
 st.dataframe(agg.head(50), width="stretch")
+
+existing_mongo_indexes: list[MongoIndex] = []
+if db_type == "MongoDB":
+    existing_mongo_indexes = _render_mongodb_existing_indexes()
 
 st.subheader("Detailed Query Analysis")
 min_occ = st.slider("Minimum occurrences", 1, int(max(1, agg["occurrences"].max())), 2)
@@ -288,15 +386,39 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
 
         st.markdown("#### Index & Query Suggestions")
         recommendations = recommendations_for_query(db_type, representative_query, namespace)
+        recommendation_reviews = []
         for recommendation in recommendations:
+            index_review = None
+            if db_type == "MongoDB" and existing_mongo_indexes and recommendation.example:
+                suggested_index = suggested_index_from_example(recommendation.example)
+                if suggested_index:
+                    index_review = review_suggested_index(
+                        suggested_index,
+                        existing_mongo_indexes,
+                        namespace,
+                    )
+            recommendation_reviews.append((recommendation, index_review))
+
+        for recommendation, index_review in recommendation_reviews:
             expanded = recommendation.priority == "High"
             with st.expander(
                 f"{recommendation.priority} - {recommendation.category}: {recommendation.title}",
                 expanded=expanded,
             ):
                 st.write(recommendation.rationale)
+                if index_review:
+                    st.write(f"Existing index check: {index_review.status}. {index_review.detail}")
                 if recommendation.example:
                     st.code(recommendation.example, language=_explain_language(db_type))
+
+        index_review_rows = [
+            review_row(recommendation.title, index_review)
+            for recommendation, index_review in recommendation_reviews
+            if index_review
+        ]
+        if index_review_rows:
+            st.markdown("#### Suggested Index Review")
+            st.dataframe(pd.DataFrame(index_review_rows), width="stretch")
 
         st.markdown("#### Explain Plan Guidance")
         st.markdown(
