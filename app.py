@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 from typing import Any, Optional
 
 import pandas as pd
@@ -57,6 +58,7 @@ def _browser_upload_rows(db_type: str, raw_text: str) -> list[dict[str, Any]]:
                 "normalized_query": normalize_query(event.query, db_type),
                 "duration_ms": event.duration_ms,
                 "namespace": event.namespace,
+                "plan_summary": event.plan_summary,
                 "source_line": event.source_line,
                 "file_name": None,
             }
@@ -93,29 +95,66 @@ def _first_namespace(query_df: pd.DataFrame) -> Optional[str]:
     return str(values.iloc[0]) if not values.empty else None
 
 
+def _collection_from_namespace(namespace: Optional[str]) -> Optional[str]:
+    if not namespace or "." not in namespace:
+        return None
+    return namespace.split(".", 1)[1]
+
+
+def _collection_from_query(query_text: str, namespace: Optional[str]) -> Optional[str]:
+    try:
+        command = json.loads(query_text)
+    except json.JSONDecodeError:
+        return _collection_from_namespace(namespace)
+
+    if not isinstance(command, dict):
+        return _collection_from_namespace(namespace)
+
+    for key in (
+        "find",
+        "aggregate",
+        "count",
+        "distinct",
+        "insert",
+        "update",
+        "delete",
+        "findAndModify",
+        "findandmodify",
+    ):
+        collection = command.get(key)
+        if isinstance(collection, str):
+            return collection
+    return _collection_from_namespace(namespace)
+
+
 def _explain_language(db_type: str) -> str:
     return "javascript" if db_type == "MongoDB" else "sql"
 
 
-def _render_mongodb_existing_indexes() -> list[MongoIndex]:
-    with st.expander("Share MongoDB Indexes"):
-        st.caption("Can you share the current collection indexes? Paste `getIndexes()` JSON output here for more accurate suggestions.")
+def _render_mongodb_existing_indexes(collection: Optional[str], key_suffix: str) -> list[MongoIndex]:
+    collection_label = collection or "<collection>"
+    with st.expander(f"Share MongoDB Indexes for {collection_label}"):
+        st.caption(
+            "Can you share the current collection indexes? Paste `getIndexes()` JSON output "
+            "for this query's collection for more accurate suggestions."
+        )
         st.code(
-            'JSON.stringify(db.getCollection("<collection>").getIndexes())',
+            f'JSON.stringify(db.getCollection("{collection_label}").getIndexes())',
             language="javascript",
         )
         raw_indexes = st.text_area(
-            "Paste getIndexes() JSON output",
+            f"Paste getIndexes() JSON output for {collection_label}",
             height=160,
             help="Optional. Share current collection indexes so suggestions can be marked as already existing, covered, or new.",
             placeholder='[{"name":"status_1_customerId_1","key":{"status":1,"customerId":1}}]',
+            key=f"mongo_indexes_{key_suffix}",
         )
 
         if not raw_indexes.strip():
             return []
 
         try:
-            existing_indexes = parse_mongo_indexes(raw_indexes)
+            existing_indexes = parse_mongo_indexes(raw_indexes, default_collection=collection)
         except ValueError as exc:
             LOGGER.warning("mongo_index_parse_failed error=%s", exc)
             st.error(str(exc))
@@ -136,7 +175,8 @@ def _render_mongodb_existing_indexes() -> list[MongoIndex]:
             st.dataframe(pd.DataFrame(redundant), width="stretch")
 
         LOGGER.info(
-            "mongo_indexes_loaded index_count=%s duplicate_groups=%s redundant_candidates=%s",
+            "mongo_indexes_loaded collection=%s index_count=%s duplicate_groups=%s redundant_candidates=%s",
+            collection_label,
             len(existing_indexes),
             len(duplicates),
             len(redundant),
@@ -265,32 +305,52 @@ if not rows:
 df = pd.DataFrame(rows)
 df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
 df["duration_ms"] = pd.to_numeric(df["duration_ms"], errors="coerce").fillna(0)
+if "plan_summary" not in df:
+    df["plan_summary"] = ""
+if "source_line" not in df:
+    df["source_line"] = ""
+df["plan_summary"] = df["plan_summary"].fillna("")
+df["source_line"] = df["source_line"].fillna("")
+df["is_collection_scan"] = (
+    df["plan_summary"].str.contains("COLLSCAN", case=False, na=False)
+    | df["source_line"].str.contains("COLLSCAN", case=False, na=False)
+)
 
 agg = (
     df.groupby("normalized_query", as_index=False)
     .agg(
+        namespace=("namespace", lambda values: next((str(value) for value in values.dropna()), "")),
         occurrences=("normalized_query", "count"),
         total_duration_ms=("duration_ms", "sum"),
         avg_duration_ms=("duration_ms", "mean"),
         max_duration_ms=("duration_ms", "max"),
+        collection_scans=("is_collection_scan", "sum"),
     )
     .sort_values(["total_duration_ms", "occurrences"], ascending=[False, False])
 )
+agg["collection_scans"] = agg["collection_scans"].astype(int)
+agg["collection_scan_rate"] = (agg["collection_scans"] / agg["occurrences"] * 100).round(1)
+agg["collection"] = agg.apply(
+    lambda row: _collection_from_query(str(row["normalized_query"]), str(row["namespace"]) or None) or "",
+    axis=1,
+)
 LOGGER.info(
-    "analysis_ready db_type=%s db_version=%s rows=%s unique_query_count=%s total_duration_ms=%.2f",
+    "analysis_ready db_type=%s db_version=%s rows=%s unique_query_count=%s total_duration_ms=%.2f collection_scans=%s",
     db_type,
     db_version,
     len(df),
     len(agg),
     df["duration_ms"].sum(),
+    int(df["is_collection_scan"].sum()),
 )
 
 st.subheader("Top Query Review")
-metric1, metric2, metric3, metric4 = st.columns(4)
+metric1, metric2, metric3, metric4, metric5 = st.columns(5)
 metric1.metric("Parsed events", len(df))
 metric2.metric("Unique query shapes", len(agg))
 metric3.metric("Total observed time (ms)", f"{df['duration_ms'].sum():,.2f}")
 metric4.metric("Average latency (ms)", f"{df['duration_ms'].mean():,.2f}")
+metric5.metric("Collection scans", int(df["is_collection_scan"].sum()))
 
 left, right = st.columns(2)
 with left:
@@ -317,22 +377,81 @@ with right:
     fig_occ.update_layout(yaxis={"categoryorder": "total ascending"})
     st.plotly_chart(fig_occ, width="stretch")
 
-st.dataframe(agg.head(50), width="stretch")
+if db_type == "MongoDB" and agg["collection_scans"].sum() > 0:
+    top_scans = agg.sort_values(["collection_scans", "total_duration_ms"], ascending=[False, False]).head(15)
+    fig_scans = px.bar(
+        top_scans,
+        x="collection_scans",
+        y="normalized_query",
+        orientation="h",
+        title="Top queries by collection scans",
+    )
+    fig_scans.update_layout(yaxis={"categoryorder": "total ascending"})
+    st.plotly_chart(fig_scans, width="stretch")
 
-existing_mongo_indexes: list[MongoIndex] = []
-if db_type == "MongoDB":
-    existing_mongo_indexes = _render_mongodb_existing_indexes()
+review_columns = [
+    "collection",
+    "occurrences",
+    "collection_scans",
+    "collection_scan_rate",
+    "total_duration_ms",
+    "avg_duration_ms",
+    "max_duration_ms",
+    "normalized_query",
+]
+st.dataframe(agg[[column for column in review_columns if column in agg]].head(50), width="stretch")
 
 st.subheader("Detailed Query Analysis")
-min_occ = st.slider("Minimum occurrences", 1, int(max(1, agg["occurrences"].max())), 2)
-analysis_limit = st.slider("Number of top queries to analyze", 1, 50, 10)
-frequent = agg[agg["occurrences"] >= min_occ]
-if frequent.empty:
-    st.warning("No query meets selected minimum occurrences.")
+focus_options = {
+    "High occurrence": ["occurrences", "total_duration_ms"],
+    "Collection scan": ["collection_scans", "total_duration_ms", "occurrences"],
+    "High total duration": ["total_duration_ms", "occurrences"],
+    "High average duration": ["avg_duration_ms", "occurrences"],
+    "High max duration": ["max_duration_ms", "occurrences"],
+}
+default_focus = "Collection scan" if db_type == "MongoDB" and agg["collection_scans"].sum() > 0 else "High total duration"
+focus = st.selectbox(
+    "Analysis focus",
+    list(focus_options.keys()),
+    index=list(focus_options.keys()).index(default_focus),
+)
+
+filter1, filter2, filter3, filter4 = st.columns(4)
+max_occurrences = int(max(1, agg["occurrences"].max()))
+with filter1:
+    min_occ = st.number_input(
+        "Minimum occurrences",
+        min_value=1,
+        max_value=max_occurrences,
+        value=min(2, max_occurrences),
+        step=1,
+    )
+with filter2:
+    min_avg_duration = st.number_input("Minimum average duration (ms)", min_value=0.0, value=0.0, step=10.0)
+with filter3:
+    min_max_duration = st.number_input("Minimum max duration (ms)", min_value=0.0, value=0.0, step=10.0)
+with filter4:
+    analysis_limit = st.number_input("Queries to analyze", min_value=1, max_value=50, value=10, step=1)
+
+only_collection_scans = False
+if db_type == "MongoDB":
+    only_collection_scans = st.checkbox("Only queries with collection scans", value=focus == "Collection scan")
+
+filtered_queries = agg[
+    (agg["occurrences"] >= min_occ)
+    & (agg["avg_duration_ms"] >= min_avg_duration)
+    & (agg["max_duration_ms"] >= min_max_duration)
+].copy()
+if only_collection_scans:
+    filtered_queries = filtered_queries[filtered_queries["collection_scans"] > 0]
+
+if filtered_queries.empty:
+    st.warning("No query meets the selected occurrence, collection scan, and duration filters.")
     st.stop()
 
-ranked = frequent.sort_values(["total_duration_ms", "occurrences"], ascending=[False, False]).head(
-    analysis_limit
+rank_columns = focus_options[focus]
+ranked = filtered_queries.sort_values(rank_columns, ascending=[False] * len(rank_columns)).head(
+    int(analysis_limit)
 )
 if ranked.empty:
     st.warning("No query available for detailed analysis.")
@@ -357,14 +476,25 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
     sample_originals = Counter(query_df["query"]).most_common(3)
     representative_query = sample_originals[0][0] if sample_originals else query_text
     namespace = _first_namespace(query_df)
+    collection = str(selected.get("collection") or "") or _collection_from_query(representative_query, namespace)
+    plan_summaries = [str(value) for value in query_df["plan_summary"].dropna().unique() if str(value).strip()]
 
     with st.container(border=True):
         st.markdown(f"### #{rank} Query")
         st.code(query_text, language=_explain_language(db_type))
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Occurrences", int(selected["occurrences"]))
         m2.metric("Total duration (ms)", f"{selected['total_duration_ms']:.2f}")
         m3.metric("Average duration (ms)", f"{selected['avg_duration_ms']:.2f}")
+        m4.metric("Max duration (ms)", f"{selected['max_duration_ms']:.2f}")
+        m5.metric("Collection scans", int(selected.get("collection_scans", 0)))
+        if db_type == "MongoDB":
+            st.write(
+                f"Collection: `{collection or '<unknown>'}` | "
+                f"Collection scan rate: `{selected.get('collection_scan_rate', 0):.1f}%`"
+            )
+            if plan_summaries:
+                st.write(f"Observed plan summaries: `{', '.join(plan_summaries[:5])}`")
 
         fig_hist = px.histogram(
             query_df,
@@ -383,6 +513,10 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
                 title=f"Latency timeline for query #{rank}",
             )
             st.plotly_chart(fig_line, width="stretch")
+
+        existing_mongo_indexes: list[MongoIndex] = []
+        if db_type == "MongoDB":
+            existing_mongo_indexes = _render_mongodb_existing_indexes(collection, str(rank))
 
         st.markdown("#### Index & Query Suggestions")
         recommendations = recommendations_for_query(db_type, representative_query, namespace)
