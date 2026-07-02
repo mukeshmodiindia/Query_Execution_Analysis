@@ -15,10 +15,12 @@ The app is a log analyzer. It does not connect to MongoDB, MySQL, or PostgreSQL 
 - Upload logs through the browser or with the CLI uploader.
 - Review top queries by total duration, average latency, and occurrence count.
 - Analyze repeated query shapes with histograms, timelines, raw query samples, and tuning suggestions.
+- Filter detailed analysis by high occurrence, collection scans, average duration, and max duration.
 - Generate explain-plan commands for MongoDB, MySQL, and PostgreSQL.
 - Show MongoDB version notes and official explain documentation links.
-- Optionally paste MongoDB `getIndexes()` output so suggested indexes can be marked as already existing, covered by a compound index, partially overlapping, or new.
-- Detect duplicate and potentially redundant MongoDB indexes from shared `getIndexes()` output.
+- Parse MongoDB `planSummary` values such as `COLLSCAN` from logs and rank query shapes by collection scans.
+- Optionally paste MongoDB `getIndexes()` output per query collection so suggested indexes can be marked as already existing, covered by a compound index, partially overlapping, or new.
+- Detect duplicate and potentially redundant MongoDB indexes from shared per-collection `getIndexes()` output.
 - Emit application logs to stdout so systemd can capture them in `journalctl`.
 
 ## Install And Run
@@ -154,15 +156,21 @@ For systemd, add the same environment variable to the service file:
 Environment="QUERY_ANALYSIS_UPLOAD_DIR=/data/query-analysis-uploads"
 ```
 
-## Share MongoDB Indexes
+## Share MongoDB Indexes Per Query
 
-For better MongoDB recommendations, share the current collection indexes from `mongosh`:
+For better MongoDB recommendations, open a MongoDB query in `Detailed Query Analysis` and share the current indexes for that query's collection from `mongosh`:
 
 ```javascript
-JSON.stringify(db.getCollection("<collection>").getIndexes())
+JSON.stringify(db.getCollection("stories").getIndexes())
 ```
 
-Paste the output into `Share MongoDB Indexes` in the dashboard. The app uses that pasted JSON to show whether a suggested index already exists, is covered by a longer compound index, partially overlaps, or appears to be new.
+Paste the output into that query's `Share MongoDB Indexes for <collection>` section. The app uses the query collection as context, so output like this is attributed to `stories` when pasted in the `stories` query card:
+
+```json
+[{"v":2,"key":{"diggs":1},"name":"diggs_1"},{"v":2,"key":{"_id":1},"name":"_id_"}]
+```
+
+The app then shows whether a suggested index already exists, is covered by a longer compound index, partially overlaps, or appears to be new. It also shows duplicate and potentially redundant indexes for that collection.
 
 You can also share multiple collections as JSON:
 
