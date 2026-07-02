@@ -1,136 +1,44 @@
 # Query Execution Analysis Dashboard
 
-A Streamlit dashboard that reviews top queries from database logs, then analyzes the highest-time queries by occurrence count.
+A Streamlit dashboard for reviewing slow query logs, grouping repeated query shapes, and generating version-aware explain-plan and index guidance.
 
-## Supported databases
-- MongoDB (v6.0, v7.0, v8.0 profiles)
-- MySQL (v5.7, v8.0 profiles)
-- PostgreSQL (v12, v13, v14, v15, v16 profiles)
+The app is a log analyzer. It does not connect to MongoDB, MySQL, or PostgreSQL by default, and it does not execute queries against production.
+
+## Supported Databases
+
+- MongoDB 6.0, 7.0, 8.0
+- MySQL 5.7, 8.0
+- PostgreSQL 12, 13, 14, 15, 16
 
 ## Features
-- Upload one or multiple logs from either:
-  - the Streamlit browser uploader/paste box
-  - the command prompt with `upload_logs.py`, then review the batch in the UI
-- Top query review by:
-  - total duration
-  - average duration
-  - occurrence count
-- Detailed view for frequently occurring high-time query shapes.
-- Index and query rewrite suggestions for MongoDB, MySQL, and PostgreSQL query shapes.
-- Explain-plan simulation workflow:
-  - MongoDB `explain()` (`queryPlanner`)
-  - MongoDB `explain('executionStats')`
-  - MongoDB `explain('allPlansExecution')` with warning banner
-- UI dashboards:
-  - bar charts for top queries
-  - latency distribution histograms
-  - timeline and table views
-- Version-aware notes with links to official docs for MongoDB, MySQL, PostgreSQL.
 
-> Note: This tool does not execute queries directly against your database by default. It generates the exact commands and guidance for running explain plans safely. You can wire in live execution in your environment.
+- Upload logs through the browser or with the CLI uploader.
+- Review top queries by total duration, average latency, and occurrence count.
+- Analyze repeated query shapes with histograms, timelines, raw query samples, and tuning suggestions.
+- Generate explain-plan commands for MongoDB, MySQL, and PostgreSQL.
+- Show MongoDB version notes and official explain documentation links.
+- Optionally paste MongoDB `getIndexes()` output so suggested indexes can be marked as already existing, covered by a compound index, partially overlapping, or new.
+- Detect duplicate and potentially redundant MongoDB indexes from shared `getIndexes()` output.
+- Emit application logs to stdout so systemd can capture them in `journalctl`.
 
-## Log file upload limits
+## Install And Run
 
-- The UI supports uploading **up to 20 log files per run**.
-- You can upload **10 or 20 files** directly from the uploader.
-- If more than 20 files are selected, the app stops with a clear error.
-- There is no hard per-file size check in code, but very large files consume memory because they are combined and processed in Python.
+### 1. Install System Packages
 
-### Practical sizing guidance
-For large datasets (for example 10 files × 2 GB each), process logs in batches or pre-filter logs first, because in-memory parsing and DataFrame aggregation can use significant RAM.
-
-## Quick start (local)
-
-On Ubuntu/Debian, install the Python venv package before creating `.venv`:
+Ubuntu or Debian:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
+sudo apt install -y git python3 python3-venv python3-pip nginx
 ```
 
-If `python3 -m venv .venv` reports that `ensurepip` is unavailable, install the
-venv package for your exact Python version, for example:
+RHEL, Rocky, or AlmaLinux:
 
 ```bash
-sudo apt install -y python3.12-venv
+sudo dnf install -y git python3 python3-pip nginx
 ```
 
-Then create and activate the environment:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Upload logs from command prompt
-
-Use the CLI uploader when logs are on the server/VM and you want the analysis to appear in the Streamlit UI.
-
-```bash
-python upload_logs.py --db MongoDB --version 8.0 --label prod-mongo-logs /var/log/mongodb/mongod.log
-python upload_logs.py --db MySQL --version 8.0 --label mysql-slow /var/log/mysql/mysql-slow.log
-python upload_logs.py --db PostgreSQL --version 16 --label postgres-duration /var/log/postgresql/postgresql.log
-```
-
-Then open or refresh Streamlit and choose **Command-line uploads** as the log source.
-
-By default, parsed batches are stored under `.query_analysis_uploads/`. To share a different location between the CLI and UI, set `QUERY_ANALYSIS_UPLOAD_DIR` before running both commands:
-
-```bash
-export QUERY_ANALYSIS_UPLOAD_DIR=/data/query-analysis-uploads
-python upload_logs.py --db MongoDB --version 8.0 --label nightly samples/mongodb_sample.log
-streamlit run app.py
-```
-
-The CLI stores parsed query events and a manifest. It does not execute queries against MongoDB, MySQL, or PostgreSQL.
-
-## OS and package requirements
-
-### Supported OS
-- Ubuntu 22.04/24.04 LTS
-- Debian 12+
-- RHEL/Rocky/AlmaLinux 8+
-
-### Required system packages (Linux)
-Install common runtime packages before Python dependencies:
-
-```bash
-# Ubuntu/Debian
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip nginx
-
-# RHEL/Rocky/AlmaLinux
-sudo dnf install -y python3 python3-pip nginx
-python3 -m venv .venv
-```
-
-### Python packages
-Use Python 3.10+ for current Streamlit compatibility.
-
-Python dependencies are listed in `requirements.txt`:
-- `streamlit>=1.58.0`
-- `pandas>=2.0.0`
-- `plotly>=5.20.0`
-
-Install with:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Cloud installation guide (AWS/Azure/GCP Linux VM)
-
-The steps are the same across AWS EC2, Azure VM, and GCP Compute Engine.
-
-### 1) Provision VM
-- Linux VM (Ubuntu 22.04 LTS recommended)
-- Open ports:
-  - `22` for SSH
-  - `80` for Nginx
-
-### 2) Clone and install
+### 2. Clone And Install Python Packages
 
 ```bash
 git clone https://github.com/mukeshmodiindia/Query_Execution_Analysis.git
@@ -141,13 +49,27 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3) Run Streamlit on localhost
+Python 3.10 or newer is recommended. Python dependencies are listed in `requirements.txt`.
+
+### 3. Run Locally
+
+For a local workstation:
+
+```bash
+streamlit run app.py
+```
+
+Open the URL shown by Streamlit, usually `http://localhost:8501`.
+
+### 4. Run On A Cloud VM
+
+For a server exposed through Nginx, keep Streamlit bound to localhost:
 
 ```bash
 streamlit run app.py --server.address 127.0.0.1 --server.port 8501
 ```
 
-For persistent service, use systemd (`/etc/systemd/system/query-analysis.service`):
+Create `/etc/systemd/system/query-analysis.service`:
 
 ```ini
 [Unit]
@@ -155,17 +77,18 @@ Description=Query Execution Analysis Streamlit App
 After=network.target
 
 [Service]
-User=ubuntu
-WorkingDirectory=/home/ubuntu/Query_Execution_Analysis
-Environment="PATH=/home/ubuntu/Query_Execution_Analysis/.venv/bin"
-ExecStart=/home/ubuntu/Query_Execution_Analysis/.venv/bin/streamlit run app.py --server.address 127.0.0.1 --server.port 8501
+User=percona
+WorkingDirectory=/home/percona/Query_Execution_Analysis
+Environment="PATH=/home/percona/Query_Execution_Analysis/.venv/bin"
+Environment="QUERY_ANALYSIS_LOG_LEVEL=INFO"
+ExecStart=/home/percona/Query_Execution_Analysis/.venv/bin/streamlit run app.py --server.address 127.0.0.1 --server.port 8501
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Then:
+Enable and start the service:
 
 ```bash
 sudo systemctl daemon-reload
@@ -173,8 +96,7 @@ sudo systemctl enable --now query-analysis
 sudo systemctl status query-analysis
 ```
 
-### 4) Configure Nginx to expose UI
-Create `/etc/nginx/sites-available/query-analysis`:
+Configure Nginx to proxy port 80 to Streamlit. Create `/etc/nginx/sites-available/query-analysis`:
 
 ```nginx
 server {
@@ -202,49 +124,169 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-Now open: `http://<your-server-public-ip>/`
+Open `http://<server-public-ip>/`.
 
-## Infrastructure sizing recommendation (10 logs × 2 GB = 20 GB total)
+If you want to access Streamlit directly at `http://<server-public-ip>:8501`, change the service to `--server.address 0.0.0.0`, then open TCP port `8501` in the VM firewall and cloud security group.
 
-For mixed MongoDB/MySQL/PostgreSQL logs with pandas-based parsing in this app:
+## Upload Logs From CLI
 
-- **Minimum (batch processing, lower concurrency):**
-  - 8 vCPU
-  - 32 GB RAM
-  - 100+ GB SSD
-- **Recommended (stable parsing/aggregation, safer headroom):**
-  - 16 vCPU
-  - 64 GB RAM
-  - 200+ GB SSD
-- **Heavy/production with multiple users:**
-  - 16–32 vCPU
-  - 64–128 GB RAM
-  - 300+ GB SSD
+Use the CLI when logs are already on the server or are too large for browser upload:
 
-### Why these numbers?
-- Raw logs (20 GB) expand in memory during parsing.
-- DataFrame/group-by operations add overhead.
-- Concurrent users and larger query cardinality increase peak RAM/CPU demand.
+```bash
+python upload_logs.py --db MongoDB --version 8.0 --label prod-mongo-logs /var/log/mongodb/mongod.log
+python upload_logs.py --db MySQL --version 8.0 --label mysql-slow /var/log/mysql/mysql-slow.log
+python upload_logs.py --db PostgreSQL --version 16 --label postgres-duration /var/log/postgresql/postgresql.log
+```
 
-### Example cloud instance families
-- AWS: `m6i.2xlarge` (8 vCPU/32 GB) minimum, `m6i.4xlarge` (16 vCPU/64 GB) recommended
-- Azure: `D8s v5` minimum, `D16s v5` recommended
-- GCP: `n2-standard-8` minimum, `n2-standard-16` recommended
+Then refresh Streamlit and choose `Command-line uploads`.
 
-## Sample log formats
+By default, uploaded batches are stored in `.query_analysis_uploads/`. To share a different location between the CLI and Streamlit service:
 
-### MongoDB
+```bash
+export QUERY_ANALYSIS_UPLOAD_DIR=/data/query-analysis-uploads
+python upload_logs.py --db MongoDB --version 8.0 --label nightly /var/log/mongodb/mongod.log
+streamlit run app.py
+```
+
+For systemd, add the same environment variable to the service file:
+
+```ini
+Environment="QUERY_ANALYSIS_UPLOAD_DIR=/data/query-analysis-uploads"
+```
+
+## Share MongoDB Indexes
+
+For better MongoDB recommendations, share the current collection indexes from `mongosh`:
+
+```javascript
+JSON.stringify(db.getCollection("<collection>").getIndexes())
+```
+
+Paste the output into `Share MongoDB Indexes` in the dashboard. The app uses that pasted JSON to show whether a suggested index already exists, is covered by a longer compound index, partially overlaps, or appears to be new.
+
+You can also share multiple collections as JSON:
+
+```json
+{
+  "orders": [
+    {"name": "status_1_customerId_1", "key": {"status": 1, "customerId": 1}}
+  ],
+  "inventory": [
+    {"name": "sku_1", "key": {"sku": 1}}
+  ]
+}
+```
+
+## Troubleshooting
+
+### Browser Times Out On `http://<server-ip>:8501`
+
+Your service is bound to `127.0.0.1:8501`, which is only reachable from the server itself. That is expected with the recommended Nginx setup.
+
+Use one of these options:
+
+- Open `http://<server-ip>/` through Nginx on port 80.
+- Or change Streamlit to `--server.address 0.0.0.0` and open port `8501` in the VM firewall and cloud security group.
+
+Check from the server:
+
+```bash
+curl -I http://127.0.0.1:8501
+curl -I http://127.0.0.1
+```
+
+Check listening sockets:
+
+```bash
+sudo ss -ltnp | grep -E ':80|:8501'
+```
+
+### Query Analysis Logs
+
+Application logs go to stdout and are captured by systemd:
+
+```bash
+sudo journalctl -u query-analysis -f
+sudo journalctl -u query-analysis --since "30 minutes ago"
+```
+
+For more detail, set:
+
+```ini
+Environment="QUERY_ANALYSIS_LOG_LEVEL=DEBUG"
+```
+
+Then reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart query-analysis
+```
+
+### Nginx `conflicting server name "_"` Warning
+
+This means more than one enabled Nginx site is using `server_name _` on port 80. Nginx will ignore one of them.
+
+Inspect enabled sites:
+
+```bash
+sudo nginx -T | grep -n "server_name _"
+ls -l /etc/nginx/sites-enabled
+```
+
+Disable the duplicate default site if needed:
+
+```bash
+sudo unlink /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+### No Query Events Parsed
+
+Confirm the selected database matches the log format and rerun the CLI uploader:
+
+```bash
+python upload_logs.py --db MongoDB --version 8.0 --label prod-mongo-logs /var/log/mongodb/mongod.log
+```
+
+Then check the parsed event count:
+
+```bash
+sudo journalctl -u query-analysis --since "30 minutes ago"
+```
+
+## Log Upload Limits
+
+- Browser upload accepts up to 20 files per run.
+- Large files are processed in memory, so use the CLI uploader for large production logs.
+- For very large batches, pre-filter logs or process them in smaller batches.
+
+## Infrastructure Sizing
+
+For large mixed database logs with pandas-based aggregation:
+
+- Minimum: 8 vCPU, 32 GB RAM, 100 GB SSD
+- Recommended: 16 vCPU, 64 GB RAM, 200 GB SSD
+- Heavy usage: 16 to 32 vCPU, 64 to 128 GB RAM, 300 GB SSD
+
+## Sample Log Formats
+
+MongoDB:
+
 ```json
 {"ts":"2026-01-01T10:00:00Z","durationMillis":240,"ns":"shop.orders","command":{"find":"orders","filter":{"status":"PENDING"}}}
 ```
 
-### MySQL slow log (single line)
+MySQL slow log:
+
 ```text
 # Query_time: 1.245  Lock_time: 0.002 Rows_sent: 10 Rows_examined: 905
 SELECT * FROM orders WHERE status = 'PENDING';
 ```
 
-### PostgreSQL log_line_prefix style sample
+PostgreSQL log:
+
 ```text
 2026-01-01 10:00:00 UTC [123] LOG:  duration: 120.500 ms  statement: SELECT * FROM orders WHERE status='PENDING';
 ```
