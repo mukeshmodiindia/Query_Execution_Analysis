@@ -8,12 +8,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from src.logging_config import configure_logging
 from src.parsers import QueryEvent, normalize_query, parser_for
 
 
 DEFAULT_UPLOAD_DIR = Path(".query_analysis_uploads")
 EVENTS_FILE = "events.jsonl"
 MANIFEST_FILE = "manifest.json"
+LOGGER = configure_logging(__name__)
 
 
 def resolve_upload_dir(upload_dir: Optional[str] = None) -> Path:
@@ -46,6 +48,14 @@ def create_upload_batch(
     root = resolve_upload_dir(upload_dir)
     batch_dir = root / batch_id
     batch_dir.mkdir(parents=True, exist_ok=False)
+    LOGGER.info(
+        "upload_batch_started id=%s db_type=%s db_version=%s files=%s upload_dir=%s",
+        batch_id,
+        db_type,
+        db_version,
+        len(paths),
+        root,
+    )
 
     event_count = 0
     total_duration_ms = 0.0
@@ -56,6 +66,13 @@ def create_upload_batch(
         for path in paths:
             text = path.read_text(encoding="utf-8", errors="ignore")
             events = parser(text)
+            LOGGER.info(
+                "upload_file_parsed batch_id=%s file=%s size_bytes=%s parsed_events=%s",
+                batch_id,
+                path,
+                path.stat().st_size,
+                len(events),
+            )
             file_summaries.append(
                 {
                     "name": path.name,
@@ -94,6 +111,13 @@ def create_upload_batch(
         json.dumps(manifest, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    LOGGER.info(
+        "upload_batch_completed id=%s event_count=%s unique_query_count=%s total_duration_ms=%.2f",
+        batch_id,
+        event_count,
+        len(normalized_queries),
+        total_duration_ms,
+    )
     return manifest
 
 
@@ -129,6 +153,7 @@ def load_upload_events(batch_id: str, upload_dir: Optional[str] = None) -> list[
         for line in event_file:
             if line.strip():
                 events.append(json.loads(line))
+    LOGGER.info("upload_events_loaded batch_id=%s event_count=%s", batch_id, len(events))
     return events
 
 
