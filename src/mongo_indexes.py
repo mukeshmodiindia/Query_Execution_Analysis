@@ -272,8 +272,10 @@ def _collection_from_ns(namespace: Any) -> Optional[str]:
 
 
 def _same_collection(left: Optional[str], right: Optional[str]) -> bool:
-    if not left or left == "<collection>" or not right:
+    if not left or left == "<collection>":
         return True
+    if not right:
+        return False
     return left == right
 
 
