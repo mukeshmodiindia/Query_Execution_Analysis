@@ -169,6 +169,7 @@ def _event_to_record(
         "normalized_query": normalized_query,
         "duration_ms": event.duration_ms,
         "namespace": event.namespace,
+        "plan_summary": event.plan_summary,
         "source_line": event.source_line,
         "file_name": file_name,
         "db_type": db_type,

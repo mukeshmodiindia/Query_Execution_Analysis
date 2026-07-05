@@ -13,6 +13,7 @@ class QueryEvent:
     query: str
     duration_ms: float
     namespace: Optional[str] = None
+    plan_summary: Optional[str] = None
     source_line: Optional[str] = None
 
 
@@ -150,7 +151,7 @@ def _extract_balanced_braces(text: str, start: int) -> Optional[str]:
     return None
 
 
-def _parse_mongodb_text_log(raw: str) -> tuple[Optional[float], Optional[str], Optional[str]]:
+def _parse_mongodb_text_log(raw: str) -> tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
     duration_match = re.search(
         r"\b(?:durationMillis|duration|millis)\s*[:=]\s*(\d+(?:\.\d+)?)\s*(?:ms)?\b",
         raw,
@@ -187,7 +188,16 @@ def _parse_mongodb_text_log(raw: str) -> tuple[Optional[float], Optional[str], O
         if query:
             break
 
-    return duration, ns, query
+    plan_summary = None
+    plan_match = re.search(r"\bplanSummary\s*[:=]\s*COLLSCAN\b", raw, re.IGNORECASE)
+    if plan_match:
+        plan_summary = "COLLSCAN"
+    else:
+        plan_match = re.search(r"\bplanSummary\s*[:=]\s*(IXSCAN\s*\{.*?\})", raw, re.IGNORECASE)
+        if plan_match:
+            plan_summary = plan_match.group(1).strip()
+
+    return duration, ns, query, plan_summary
 
 
 def parse_mongodb_logs(text: str) -> List[QueryEvent]:
@@ -200,10 +210,13 @@ def parse_mongodb_logs(text: str) -> List[QueryEvent]:
         ns = None
         query = None
         ts = None
+        plan_summary = None
 
         try:
             doc = json.loads(raw)
             attr = doc.get("attr") if isinstance(doc.get("attr"), dict) else {}
+            raw_plan_summary = _first_value(attr.get("planSummary"), doc.get("planSummary"))
+            plan_summary = str(raw_plan_summary) if raw_plan_summary is not None else None
             duration = _duration_ms(
                 _first_value(
                     doc.get("durationMillis"),
@@ -224,7 +237,7 @@ def parse_mongodb_logs(text: str) -> List[QueryEvent]:
             ns = _first_value(doc.get("ns"), attr.get("ns"), command_ns)
         except json.JSONDecodeError:
             # Try line-oriented MongoDB log pattern fallback.
-            duration, ns, query = _parse_mongodb_text_log(raw)
+            duration, ns, query, plan_summary = _parse_mongodb_text_log(raw)
 
         if duration is None or query is None:
             continue
@@ -235,6 +248,7 @@ def parse_mongodb_logs(text: str) -> List[QueryEvent]:
                 query=query,
                 duration_ms=float(duration),
                 namespace=ns,
+                plan_summary=plan_summary,
                 source_line=raw,
             )
         )

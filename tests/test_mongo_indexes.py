@@ -14,16 +14,17 @@ class MongoIndexTests(unittest.TestCase):
         indexes = parse_mongo_indexes(
             """
             [
-              {"name":"_id_","key":{"_id":1}},
-              {"name":"status_1_customerId_1","key":{"status":1,"customerId":1}}
+              {"v":2,"key":{"diggs":1},"name":"diggs_1"},
+              {"v":2,"key":{"_id":1},"name":"_id_"}
             ]
             """,
-            default_collection="orders",
+            default_collection="stories",
         )
 
         self.assertEqual(len(indexes), 2)
-        self.assertEqual(indexes[1].collection, "orders")
-        self.assertEqual(indexes[1].keys, (("status", "1"), ("customerId", "1")))
+        self.assertEqual(indexes[0].collection, "stories")
+        self.assertEqual(indexes[0].name, "diggs_1")
+        self.assertEqual(indexes[0].keys, (("diggs", "1"),))
 
     def test_marks_exact_suggestion_as_already_existing(self):
         indexes = parse_mongo_indexes(

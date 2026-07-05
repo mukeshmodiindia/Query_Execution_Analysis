@@ -31,6 +31,7 @@ class MongoDBParserTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].namespace, "prod.orders")
         self.assertEqual(events[0].duration_ms, 240)
+        self.assertEqual(events[0].plan_summary, "IXSCAN { status: 1, customerId: 1 }")
         self.assertIn('"find": "orders"', events[0].query)
 
     def test_prefers_originating_command_for_getmore(self):
@@ -72,6 +73,31 @@ class MongoDBParserTests(unittest.TestCase):
         self.assertEqual(events[0].namespace, "prod.orders")
         self.assertEqual(events[0].duration_ms, 315)
         self.assertIn('filter: { status: "PENDING"', events[0].query)
+
+    def test_parses_collection_scan_plan_summary(self):
+        log_line = json.dumps(
+            {
+                "t": {"$date": "2026-06-30T00:55:28.000+00:00"},
+                "msg": "Slow query",
+                "attr": {
+                    "ns": "prod.stories",
+                    "command": {
+                        "find": "stories",
+                        "filter": {"diggs": {"$gte": 10}},
+                        "$db": "prod",
+                    },
+                    "planSummary": "COLLSCAN",
+                    "durationMillis": 1200,
+                },
+            }
+        )
+
+        events = parse_mongodb_logs(log_line)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].namespace, "prod.stories")
+        self.assertEqual(events[0].plan_summary, "COLLSCAN")
+        self.assertEqual(events[0].duration_ms, 1200)
 
 
 if __name__ == "__main__":
