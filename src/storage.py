@@ -171,6 +171,8 @@ def _event_to_record(
         "namespace": event.namespace,
         "plan_summary": event.plan_summary,
         "source_line": event.source_line,
+        "query_hash": event.query_hash,
+        "op_type": event.op_type,
         "file_name": file_name,
         "db_type": db_type,
     }

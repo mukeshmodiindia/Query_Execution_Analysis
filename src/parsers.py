@@ -15,6 +15,8 @@ class QueryEvent:
     namespace: Optional[str] = None
     plan_summary: Optional[str] = None
     source_line: Optional[str] = None
+    query_hash: Optional[str] = None
+    op_type: Optional[str] = None
 
 
 def _safe_parse_ts(value: Any) -> Optional[datetime]:
@@ -151,7 +153,9 @@ def _extract_balanced_braces(text: str, start: int) -> Optional[str]:
     return None
 
 
-def _parse_mongodb_text_log(raw: str) -> tuple[Optional[float], Optional[str], Optional[str], Optional[str]]:
+def _parse_mongodb_text_log(
+    raw: str,
+) -> tuple[Optional[float], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
     duration_match = re.search(
         r"\b(?:durationMillis|duration|millis)\s*[:=]\s*(\d+(?:\.\d+)?)\s*(?:ms)?\b",
         raw,
@@ -197,7 +201,21 @@ def _parse_mongodb_text_log(raw: str) -> tuple[Optional[float], Optional[str], O
         if plan_match:
             plan_summary = plan_match.group(1).strip()
 
-    return duration, ns, query, plan_summary
+    query_hash = None
+    hash_match = re.search(r"\bqueryHash\s*[:=]\s*\"?([0-9A-Fa-f]+)\"?", raw)
+    if hash_match:
+        query_hash = hash_match.group(1)
+
+    op_type = None
+    op_match = re.search(
+        r"\[\S+\]\s+(command|query|update|remove|insert|getmore)\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if op_match:
+        op_type = op_match.group(1).lower()
+
+    return duration, ns, query, plan_summary, query_hash, op_type
 
 
 def parse_mongodb_logs(text: str) -> List[QueryEvent]:
@@ -211,6 +229,8 @@ def parse_mongodb_logs(text: str) -> List[QueryEvent]:
         query = None
         ts = None
         plan_summary = None
+        query_hash = None
+        op_type = None
 
         try:
             doc = json.loads(raw)
@@ -235,9 +255,13 @@ def parse_mongodb_logs(text: str) -> List[QueryEvent]:
             if query is None:
                 query, command_ns = _mongo_query_from_container(doc)
             ns = _first_value(doc.get("ns"), attr.get("ns"), command_ns)
+            raw_query_hash = _first_value(attr.get("queryHash"), doc.get("queryHash"))
+            query_hash = str(raw_query_hash) if raw_query_hash is not None else None
+            raw_op_type = _first_value(attr.get("type"), doc.get("type"))
+            op_type = str(raw_op_type).lower() if raw_op_type is not None else None
         except json.JSONDecodeError:
             # Try line-oriented MongoDB log pattern fallback.
-            duration, ns, query, plan_summary = _parse_mongodb_text_log(raw)
+            duration, ns, query, plan_summary, query_hash, op_type = _parse_mongodb_text_log(raw)
 
         if duration is None or query is None:
             continue
@@ -250,6 +274,8 @@ def parse_mongodb_logs(text: str) -> List[QueryEvent]:
                 namespace=ns,
                 plan_summary=plan_summary,
                 source_line=raw,
+                query_hash=query_hash,
+                op_type=op_type,
             )
         )
 
