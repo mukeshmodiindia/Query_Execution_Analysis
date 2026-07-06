@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import re
@@ -21,6 +22,15 @@ LOGGER = configure_logging(__name__)
 def resolve_upload_dir(upload_dir: Optional[str] = None) -> Path:
     configured = upload_dir or os.environ.get("QUERY_ANALYSIS_UPLOAD_DIR")
     return Path(configured) if configured else DEFAULT_UPLOAD_DIR
+
+
+def decode_log_bytes(raw_bytes: bytes, file_name: str) -> str:
+    if file_name.lower().endswith(".gz"):
+        try:
+            raw_bytes = gzip.decompress(raw_bytes)
+        except OSError as exc:
+            raise ValueError(f"Failed to decompress gzip file '{file_name}': {exc}") from exc
+    return raw_bytes.decode("utf-8", errors="ignore")
 
 
 def create_upload_batch(
@@ -64,7 +74,7 @@ def create_upload_batch(
 
     with (batch_dir / EVENTS_FILE).open("w", encoding="utf-8") as event_file:
         for path in paths:
-            text = path.read_text(encoding="utf-8", errors="ignore")
+            text = decode_log_bytes(path.read_bytes(), path.name)
             events = parser(text)
             LOGGER.info(
                 "upload_file_parsed batch_id=%s file=%s size_bytes=%s parsed_events=%s",
@@ -171,6 +181,8 @@ def _event_to_record(
         "namespace": event.namespace,
         "plan_summary": event.plan_summary,
         "source_line": event.source_line,
+        "query_hash": event.query_hash,
+        "op_type": event.op_type,
         "file_name": file_name,
         "db_type": db_type,
     }

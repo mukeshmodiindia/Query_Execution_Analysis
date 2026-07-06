@@ -24,7 +24,7 @@ from src.recommendations import (
     mongo_operation_for_query,
     recommendations_for_query,
 )
-from src.storage import list_upload_batches, load_upload_events
+from src.storage import decode_log_bytes, list_upload_batches, load_upload_events
 from src.version_profiles import VERSION_PROFILES
 
 
@@ -63,6 +63,8 @@ def _browser_upload_rows(db_type: str, raw_text: str) -> list[dict[str, Any]]:
                 "namespace": event.namespace,
                 "plan_summary": event.plan_summary,
                 "source_line": event.source_line,
+                "query_hash": event.query_hash,
+                "op_type": event.op_type,
                 "file_name": None,
             }
         )
@@ -272,9 +274,9 @@ else:
 
     uploaded = st.file_uploader(
         "Upload log files",
-        type=["log", "txt", "json"],
+        type=["log", "txt", "json", "gz"],
         accept_multiple_files=True,
-        help=f"Upload up to {MAX_LOG_FILES} files in one run.",
+        help=f"Upload up to {MAX_LOG_FILES} files in one run. Gzip-compressed files (.gz) are decompressed automatically.",
     )
     manual_text = st.text_area("Or paste log content", height=180)
 
@@ -284,7 +286,14 @@ else:
             st.error(f"You uploaded {len(uploaded)} files. The limit is {MAX_LOG_FILES} files per run.")
             st.stop()
 
-        parts = [file.getvalue().decode("utf-8", errors="ignore") for file in uploaded]
+        parts = []
+        for file in uploaded:
+            try:
+                parts.append(decode_log_bytes(file.getvalue(), file.name))
+            except ValueError as exc:
+                LOGGER.warning("browser_gzip_decode_failed file=%s error=%s", file.name, exc)
+                st.error(str(exc))
+                st.stop()
         raw_text = "\n".join(parts)
 
         total_size_mb = sum(getattr(file, "size", 0) for file in uploaded) / (1024 * 1024)
@@ -322,12 +331,19 @@ if "plan_summary" not in df:
     df["plan_summary"] = ""
 if "source_line" not in df:
     df["source_line"] = ""
+if "query_hash" not in df:
+    df["query_hash"] = ""
+if "op_type" not in df:
+    df["op_type"] = ""
 df["plan_summary"] = df["plan_summary"].fillna("")
 df["source_line"] = df["source_line"].fillna("")
+df["query_hash"] = df["query_hash"].fillna("")
+df["op_type"] = df["op_type"].fillna("")
 df["is_collection_scan"] = (
     df["plan_summary"].str.contains("COLLSCAN", case=False, na=False)
     | df["source_line"].str.contains("COLLSCAN", case=False, na=False)
 )
+df["group_key"] = df["query_hash"].where(df["query_hash"].astype(str).str.strip() != "", df["normalized_query"])
 if db_type == "MongoDB":
     df["query_operation"] = df.apply(
         lambda row: mongo_operation_for_query(
@@ -342,12 +358,14 @@ else:
     df["operation_group"] = ""
 
 agg = (
-    df.groupby("normalized_query", as_index=False)
+    df.groupby("group_key", as_index=False)
     .agg(
+        normalized_query=("normalized_query", "first"),
         namespace=("namespace", lambda values: next((str(value) for value in values.dropna()), "")),
         operation=("query_operation", lambda values: next((str(value) for value in values.dropna()), "")),
         operation_group=("operation_group", lambda values: next((str(value) for value in values.dropna()), "")),
-        occurrences=("normalized_query", "count"),
+        log_op_type=("op_type", lambda values: next((str(v) for v in values if str(v).strip()), "")),
+        occurrences=("group_key", "count"),
         total_duration_ms=("duration_ms", "sum"),
         avg_duration_ms=("duration_ms", "mean"),
         max_duration_ms=("duration_ms", "max"),
@@ -419,6 +437,7 @@ if db_type == "MongoDB" and agg["collection_scans"].sum() > 0:
 review_columns = [
     "collection",
     "operation",
+    "log_op_type",
     "occurrences",
     "collection_scans",
     "collection_scan_rate",
@@ -473,12 +492,10 @@ with filter3:
         key=f"min_max_duration_{focus}",
     )
 with filter4:
-    analysis_limit = st.number_input(
+    analysis_limit = st.radio(
         "Queries to analyze",
-        min_value=1,
-        max_value=50,
-        value=10,
-        step=1,
+        [10, 20, 50],
+        horizontal=True,
         key=f"analysis_limit_{focus}",
     )
 with filter5:
@@ -551,7 +568,7 @@ st.write(
 
 for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 1):
     query_text = selected["normalized_query"]
-    query_df = df[df["normalized_query"] == query_text].copy()
+    query_df = df[df["group_key"] == selected["group_key"]].copy()
     sample_originals = Counter(query_df["query"]).most_common(3)
     representative_query = sample_originals[0][0] if sample_originals else query_text
     namespace = _first_namespace(query_df)
@@ -569,10 +586,12 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
         m4.metric("Max duration (ms)", f"{selected['max_duration_ms']:.2f}")
         m5.metric("Collection scans", int(selected.get("collection_scans", 0)))
         if db_type == "MongoDB":
+            log_op_type = str(selected.get("log_op_type") or "")
             st.write(
                 f"Operation: `{operation or 'Unknown'}` | "
                 f"Collection: `{collection or '<unknown>'}` | "
                 f"Collection scan rate: `{selected.get('collection_scan_rate', 0):.1f}%`"
+                + (f" | Log op type: `{log_op_type}`" if log_op_type else "")
             )
             if plan_summaries:
                 st.write(f"Observed plan summaries: `{', '.join(plan_summaries[:5])}`")

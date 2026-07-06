@@ -48,6 +48,42 @@ class MongoRecommendationTests(unittest.TestCase):
         self.assertTrue(any('"tenantId": 1' in (recommendation.example or "") for recommendation in recommendations))
         self.assertTrue(any('"status": 1' in (recommendation.example or "") for recommendation in recommendations))
 
+    def test_suggests_index_for_lookup_foreign_field(self):
+        recommendations = recommendations_for_query(
+            "MongoDB",
+            (
+                '{"aggregate":"orders","pipeline":[{"$match":{"tenantId":"acme"}},'
+                '{"$lookup":{"from":"customers","localField":"customerId","foreignField":"_id"}}]}'
+            ),
+            "prod.orders",
+        )
+
+        self.assertTrue(
+            any(
+                "customers" in recommendation.title and "$lookup" in recommendation.title
+                for recommendation in recommendations
+            )
+        )
+        self.assertTrue(
+            any(
+                recommendation.example
+                and 'getCollection("customers")' in recommendation.example
+                and '"_id": 1' in recommendation.example
+                for recommendation in recommendations
+            )
+        )
+
+    def test_warns_about_array_field_matched_with_elem_match(self):
+        recommendations = recommendations_for_query(
+            "MongoDB",
+            '{"find":"stories","filter":{"tags":{"$elemMatch":{"$eq":"urgent"}}}}',
+            "prod.stories",
+        )
+
+        self.assertTrue(
+            any("multikey" in recommendation.title.lower() for recommendation in recommendations)
+        )
+
     def test_warns_when_aggregate_match_is_after_sort(self):
         recommendations = recommendations_for_query(
             "MongoDB",
