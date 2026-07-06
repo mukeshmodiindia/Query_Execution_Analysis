@@ -129,6 +129,45 @@ class MongoDBParserTests(unittest.TestCase):
         self.assertEqual(events[0].plan_summary, "COLLSCAN")
         self.assertIn('"update": "stories"', events[0].query)
 
+    def test_parses_query_hash_and_op_type_from_structured_log(self):
+        log_line = json.dumps(
+            {
+                "t": {"$date": "2026-06-30T00:55:30.000+00:00"},
+                "msg": "Slow query",
+                "attr": {
+                    "type": "command",
+                    "ns": "prod.orders",
+                    "queryHash": "ABCD1234",
+                    "command": {
+                        "find": "orders",
+                        "filter": {"status": "PENDING"},
+                        "$db": "prod",
+                    },
+                    "planSummary": "COLLSCAN",
+                    "durationMillis": 500,
+                },
+            }
+        )
+
+        events = parse_mongodb_logs(log_line)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].query_hash, "ABCD1234")
+        self.assertEqual(events[0].op_type, "command")
+
+    def test_parses_query_hash_and_op_type_from_legacy_text_log(self):
+        line = (
+            '2026-06-30T00:55:31.000+0000 I COMMAND [conn42] query prod.orders '
+            'query: { find: "orders", filter: { status: "PENDING" } } planSummary: COLLSCAN '
+            'queryHash:ABCD1234 keysExamined:0 docsExamined:100 nreturned:0 400ms'
+        )
+
+        events = parse_mongodb_logs(line)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].query_hash, "ABCD1234")
+        self.assertEqual(events[0].op_type, "query")
+
     def test_mongodb_normalization_preserves_crud_collection_names_and_sort_direction(self):
         normalized = normalize_query(
             (
