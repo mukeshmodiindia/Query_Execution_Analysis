@@ -334,12 +334,22 @@ def parse_postgres_logs(text: str) -> List[QueryEvent]:
 def _anonymize_json(value: Any, context: Optional[str] = None) -> Any:
     if isinstance(value, dict):
         return {
-            key: _anonymize_json(child, "sort_value" if context == "sort" else key)
+            key: _anonymize_json(child, "sort_value" if context in {"sort", "$sort"} else key)
             for key, child in value.items()
         }
     if isinstance(value, list):
         return [_anonymize_json(child, context) for child in value]
-    if context in {"find", "aggregate", "count", "distinct"}:
+    if context in {
+        "find",
+        "aggregate",
+        "count",
+        "distinct",
+        "insert",
+        "update",
+        "delete",
+        "findAndModify",
+        "findandmodify",
+    }:
         return value
     if context == "sort_value" and value in {1, -1, "asc", "desc", "ASC", "DESC"}:
         return value

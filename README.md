@@ -15,10 +15,13 @@ The app is a log analyzer. It does not connect to MongoDB, MySQL, or PostgreSQL 
 - Upload logs through the browser or with the CLI uploader.
 - Review top queries by total duration, average latency, and occurrence count.
 - Analyze repeated query shapes with histograms, timelines, raw query samples, and tuning suggestions.
-- Filter detailed analysis by high occurrence, collection scans, average duration, and max duration.
+- Filter detailed analysis by high occurrence, collection scans, average duration, max duration, and MongoDB operation type.
 - Generate explain-plan commands for MongoDB, MySQL, and PostgreSQL.
 - Show MongoDB version notes and official explain documentation links.
 - Parse MongoDB `planSummary` values such as `COLLSCAN` from logs and rank query shapes by collection scans.
+- Identify MongoDB CRUD reads, CRUD writes, and aggregation pipelines from logged command shapes.
+- Suggest MongoDB compound indexes using the ESR guideline: equality fields first, sort fields next, and range fields last.
+- Suggest query rewrites for risky shapes such as aggregation `$match` stages that appear after blocking stages.
 - Optionally paste MongoDB `getIndexes()` output per query collection so suggested indexes can be marked as already existing, covered by a compound index, partially overlapping, or new.
 - Detect duplicate and potentially redundant MongoDB indexes from shared per-collection `getIndexes()` output.
 - Emit application logs to stdout so systemd can capture them in `journalctl`.
@@ -184,6 +187,22 @@ You can also share multiple collections as JSON:
   ]
 }
 ```
+
+## MongoDB Query Analysis
+
+MongoDB log analysis recognizes common command shapes:
+
+- CRUD reads: `find`, `count`, and `distinct`
+- CRUD writes: `insert`, `update`, `delete`, and `findAndModify`
+- Aggregation pipelines: `aggregate` with `$match`, `$sort`, `$group`, `$lookup`, `$unwind`, and `$project` stages
+
+For index recommendations, the app uses the ESR guideline:
+
+- Equality predicates first, for example `tenantId: "acme"` or `status: "ACTIVE"`
+- Sort keys next, preserving sort direction such as `createdAt: -1`
+- Range predicates last, for example `$gt`, `$gte`, `$lt`, `$lte`, `$ne`, `$nin`, or `$regex`
+
+If a range predicate is very selective, the app also suggests comparing an ERS variant with `executionStats`. For aggregation pipelines, the app warns when `$match` appears after blocking stages and suggests moving it earlier when the match references original collection fields.
 
 ## Troubleshooting
 
