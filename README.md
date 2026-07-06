@@ -15,12 +15,16 @@ The app is a log analyzer. It does not connect to MongoDB, MySQL, or PostgreSQL 
 - Upload logs through the browser or with the CLI uploader.
 - Review top queries by total duration, average latency, and occurrence count.
 - Analyze repeated query shapes with histograms, timelines, raw query samples, and tuning suggestions.
-- Filter detailed analysis by high occurrence, collection scans, average duration, max duration, and MongoDB operation type.
+- Filter detailed analysis by high occurrence, collection scans, average duration, max duration, and MongoDB operation type, and choose the top 10, 20, or 50 queries to analyze in detail.
 - Generate explain-plan commands for MongoDB, MySQL, and PostgreSQL.
 - Show MongoDB version notes and official explain documentation links.
 - Parse MongoDB `planSummary` values such as `COLLSCAN` from logs and rank query shapes by collection scans.
+- Group repeated MongoDB query shapes by the logged `queryHash` when present, falling back to the anonymized filter/sort shape so key-order differences don't split identical queries into separate rows.
+- Surface the raw MongoDB log operation type (`command`, `query`, `update`, `remove`, `insert`, `getmore`) alongside the inferred CRUD/aggregate operation.
 - Identify MongoDB CRUD reads, CRUD writes, and aggregation pipelines from logged command shapes.
 - Suggest MongoDB compound indexes using the ESR guideline: equality fields first, sort fields next, and range fields last.
+- Suggest an index on the `$lookup` stage's `foreignField` for aggregation pipelines that join another collection.
+- Warn when a filter field looks like an array (matched with `$elemMatch`, `$all`, or an array literal), since indexing it creates a multikey index with its own limitations.
 - Suggest query rewrites for risky shapes such as aggregation `$match` stages that appear after blocking stages.
 - Optionally paste MongoDB `getIndexes()` output per query collection so suggested indexes can be marked as already existing, covered by a compound index, partially overlapping, or new.
 - Detect duplicate and potentially redundant MongoDB indexes from shared per-collection `getIndexes()` output.
