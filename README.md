@@ -147,6 +147,13 @@ python upload_logs.py --db MySQL --version 8.0 --label mysql-slow /var/log/mysql
 python upload_logs.py --db PostgreSQL --version 16 --label postgres-duration /var/log/postgresql/postgresql.log
 ```
 
+Rotated, gzip-compressed logs (`.gz`) are decompressed automatically, and you can mix `.gz` and plain-text files in the same batch:
+
+```bash
+python upload_logs.py --db MongoDB --version 8.0 --label prod-mongo-logs \
+  /var/log/mongodb/mongod.log /var/log/mongodb/mongod.log.1.gz /var/log/mongodb/mongod.log.2.gz
+```
+
 Then refresh Streamlit and choose `Command-line uploads`.
 
 By default, uploaded batches are stored in `.query_analysis_uploads/`. To share a different location between the CLI and Streamlit service:
@@ -290,6 +297,7 @@ sudo journalctl -u query-analysis --since "30 minutes ago"
 ## Log Upload Limits
 
 - Browser upload accepts up to 20 files per run.
+- Gzip-compressed log files (`.gz`) are decompressed automatically, on both the CLI uploader and browser upload. You can mix `.gz` and plain-text files in the same multi-file upload.
 - Large files are processed in memory, so use the CLI uploader for large production logs.
 - For very large batches, pre-filter logs or process them in smaller batches.
 
