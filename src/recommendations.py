@@ -16,6 +16,13 @@ class Recommendation:
 
 
 @dataclass
+class MongoLookupStage:
+    from_collection: str
+    local_field: str
+    foreign_field: str
+
+
+@dataclass
 class MongoCommandParts:
     operation: str
     collection: str
@@ -27,6 +34,14 @@ class MongoCommandParts:
     empty_filter: bool = False
     aggregate_match_after_blocking: bool = False
     aggregate_has_match: bool = False
+    array_fields: list[str] = None
+    lookups: list[MongoLookupStage] = None
+
+    def __post_init__(self) -> None:
+        if self.array_fields is None:
+            self.array_fields = []
+        if self.lookups is None:
+            self.lookups = []
 
 
 _IDENTIFIER = r"[A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?"
@@ -140,6 +155,35 @@ def _mongodb_recommendations(query_text: str, namespace: Optional[str]) -> list[
                         "range, sort order can sometimes win; verify both with executionStats."
                     ),
                     example=_mongo_index_example(parts.collection, ers_keys),
+                )
+            )
+        if parts.array_fields:
+            recommendations.append(
+                Recommendation(
+                    priority="Medium",
+                    category="Index",
+                    title="Confirm multikey index behavior for array field(s)",
+                    rationale=(
+                        f"Field(s) {', '.join(parts.array_fields)} appear to hold arrays in this filter "
+                        "(matched with `$elemMatch`/`$all` or an array literal). Indexes on array fields "
+                        "become multikey indexes: they cannot use more than one array field per compound "
+                        "index and can produce more index keys than documents. Verify cardinality and "
+                        "consider a partial index if only some array entries are queried frequently."
+                    ),
+                )
+            )
+        for lookup in parts.lookups:
+            recommendations.append(
+                Recommendation(
+                    priority="Medium",
+                    category="Index",
+                    title=f"Index the `$lookup` foreign field on `{lookup.from_collection}`",
+                    rationale=(
+                        f"`$lookup` joins `{parts.collection}.{lookup.local_field}` to "
+                        f"`{lookup.from_collection}.{lookup.foreign_field}`. Without a supporting index on "
+                        "the foreign field, MongoDB scans the foreign collection once per input document."
+                    ),
+                    example=_mongo_index_example(lookup.from_collection, [lookup.foreign_field]),
                 )
             )
         if parts.has_or:
@@ -317,11 +361,29 @@ def _mongo_command_parts(
             sort_stage = stage.get("$sort")
             if isinstance(sort_stage, dict):
                 _extend_sort_parts(parts, sort_stage)
+            lookup_stage = stage.get("$lookup")
+            if isinstance(lookup_stage, dict):
+                from_collection = lookup_stage.get("from")
+                local_field = lookup_stage.get("localField")
+                foreign_field = lookup_stage.get("foreignField")
+                if (
+                    isinstance(from_collection, str)
+                    and isinstance(local_field, str)
+                    and isinstance(foreign_field, str)
+                ):
+                    parts.lookups.append(
+                        MongoLookupStage(
+                            from_collection=from_collection,
+                            local_field=local_field,
+                            foreign_field=foreign_field,
+                        )
+                    )
             if any(key in stage for key in {"$sort", "$group", "$lookup", "$unwind", "$project"}):
                 blocking_stage_seen = True
 
     parts.equality_fields = _dedupe(parts.equality_fields)
     parts.range_fields = _dedupe(parts.range_fields)
+    parts.array_fields = _dedupe(parts.array_fields)
     parts.sort_fields = _dedupe_index_keys(parts.sort_fields)
     if (
         operation in {"Find", "Count", "Distinct", "Update", "Delete", "FindAndModify"}
@@ -342,11 +404,12 @@ def _mongo_operation(command: dict[str, Any]) -> tuple[str, str]:
 def _extend_filter_parts(parts: MongoCommandParts, filter_doc: Any) -> None:
     if not isinstance(filter_doc, dict):
         return
-    equality_fields, range_fields, has_or, has_regex = _mongo_filter_fields(filter_doc)
+    equality_fields, range_fields, has_or, has_regex, array_fields = _mongo_filter_fields(filter_doc)
     parts.equality_fields.extend(equality_fields)
     parts.range_fields.extend(range_fields)
     parts.has_or = parts.has_or or has_or
     parts.has_regex = parts.has_regex or has_regex
+    parts.array_fields.extend(array_fields)
 
 
 def _extend_sort_parts(parts: MongoCommandParts, sort_doc: Any) -> None:
@@ -362,9 +425,15 @@ def _collection_from_ns(namespace: Optional[str]) -> str:
     return parts[1] if len(parts) == 2 else namespace
 
 
-def _mongo_filter_fields(filter_doc: dict[str, Any], prefix: str = "") -> tuple[list[str], list[str], bool, bool]:
+_MONGO_ARRAY_OPERATORS = {"$elemMatch", "$all"}
+
+
+def _mongo_filter_fields(
+    filter_doc: dict[str, Any], prefix: str = ""
+) -> tuple[list[str], list[str], bool, bool, list[str]]:
     equality_fields: list[str] = []
     range_fields: list[str] = []
+    array_fields: list[str] = []
     has_or = False
     has_regex = False
     for key, value in filter_doc.items():
@@ -373,21 +442,30 @@ def _mongo_filter_fields(filter_doc: dict[str, Any], prefix: str = "") -> tuple[
             if isinstance(value, list):
                 for branch in value:
                     if isinstance(branch, dict):
-                        branch_equalities, branch_ranges, branch_has_or, branch_has_regex = _mongo_filter_fields(
-                            branch,
-                            prefix,
-                        )
+                        (
+                            branch_equalities,
+                            branch_ranges,
+                            branch_has_or,
+                            branch_has_regex,
+                            branch_arrays,
+                        ) = _mongo_filter_fields(branch, prefix)
                         equality_fields.extend(branch_equalities)
                         range_fields.extend(branch_ranges)
                         has_or = has_or or branch_has_or
                         has_regex = has_regex or branch_has_regex
+                        array_fields.extend(branch_arrays)
             continue
         if key.startswith("$"):
             continue
 
         dotted_key = f"{prefix}.{key}" if prefix else key
-        if isinstance(value, dict):
+        if isinstance(value, list):
+            equality_fields.append(dotted_key)
+            array_fields.append(dotted_key)
+        elif isinstance(value, dict):
             operator_keys = {child_key for child_key in value if child_key.startswith("$")}
+            if operator_keys & _MONGO_ARRAY_OPERATORS:
+                array_fields.append(dotted_key)
             if operator_keys:
                 if operator_keys & _MONGO_EQUALITY_OPERATORS:
                     equality_fields.append(dotted_key)
@@ -398,9 +476,8 @@ def _mongo_filter_fields(filter_doc: dict[str, Any], prefix: str = "") -> tuple[
                 if not (operator_keys & _MONGO_EQUALITY_OPERATORS) and not (operator_keys & _MONGO_RANGE_OPERATORS):
                     range_fields.append(dotted_key)
             else:
-                nested_equalities, nested_ranges, nested_has_or, nested_has_regex = _mongo_filter_fields(
-                    value,
-                    dotted_key,
+                nested_equalities, nested_ranges, nested_has_or, nested_has_regex, nested_arrays = (
+                    _mongo_filter_fields(value, dotted_key)
                 )
                 if nested_equalities or nested_ranges:
                     equality_fields.extend(nested_equalities)
@@ -409,10 +486,17 @@ def _mongo_filter_fields(filter_doc: dict[str, Any], prefix: str = "") -> tuple[
                 range_fields.extend(nested_ranges)
                 has_or = has_or or nested_has_or
                 has_regex = has_regex or nested_has_regex
+                array_fields.extend(nested_arrays)
         else:
             equality_fields.append(dotted_key)
 
-    return _dedupe(equality_fields), _dedupe(range_fields), has_or, has_regex
+    return (
+        _dedupe(equality_fields),
+        _dedupe(range_fields),
+        has_or,
+        has_regex,
+        _dedupe(array_fields),
+    )
 
 
 def _mongo_sort_fields(sort_doc: dict[str, Any]) -> list[tuple[str, str]]:
