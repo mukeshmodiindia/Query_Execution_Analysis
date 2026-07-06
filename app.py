@@ -24,7 +24,7 @@ from src.recommendations import (
     mongo_operation_for_query,
     recommendations_for_query,
 )
-from src.storage import list_upload_batches, load_upload_events
+from src.storage import decode_log_bytes, list_upload_batches, load_upload_events
 from src.version_profiles import VERSION_PROFILES
 
 
@@ -274,9 +274,9 @@ else:
 
     uploaded = st.file_uploader(
         "Upload log files",
-        type=["log", "txt", "json"],
+        type=["log", "txt", "json", "gz"],
         accept_multiple_files=True,
-        help=f"Upload up to {MAX_LOG_FILES} files in one run.",
+        help=f"Upload up to {MAX_LOG_FILES} files in one run. Gzip-compressed files (.gz) are decompressed automatically.",
     )
     manual_text = st.text_area("Or paste log content", height=180)
 
@@ -286,7 +286,14 @@ else:
             st.error(f"You uploaded {len(uploaded)} files. The limit is {MAX_LOG_FILES} files per run.")
             st.stop()
 
-        parts = [file.getvalue().decode("utf-8", errors="ignore") for file in uploaded]
+        parts = []
+        for file in uploaded:
+            try:
+                parts.append(decode_log_bytes(file.getvalue(), file.name))
+            except ValueError as exc:
+                LOGGER.warning("browser_gzip_decode_failed file=%s error=%s", file.name, exc)
+                st.error(str(exc))
+                st.stop()
         raw_text = "\n".join(parts)
 
         total_size_mb = sum(getattr(file, "size", 0) for file in uploaded) / (1024 * 1024)
