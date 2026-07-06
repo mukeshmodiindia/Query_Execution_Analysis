@@ -15,7 +15,45 @@ class Recommendation:
     example: Optional[str] = None
 
 
+@dataclass
+class MongoCommandParts:
+    operation: str
+    collection: str
+    equality_fields: list[str]
+    range_fields: list[str]
+    sort_fields: list[tuple[str, str]]
+    has_or: bool = False
+    has_regex: bool = False
+    empty_filter: bool = False
+    aggregate_match_after_blocking: bool = False
+    aggregate_has_match: bool = False
+
+
 _IDENTIFIER = r"[A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)?"
+_MONGO_OPERATION_KEYS = (
+    ("aggregate", "Aggregate"),
+    ("find", "Find"),
+    ("count", "Count"),
+    ("distinct", "Distinct"),
+    ("update", "Update"),
+    ("delete", "Delete"),
+    ("insert", "Insert"),
+    ("findAndModify", "FindAndModify"),
+    ("findandmodify", "FindAndModify"),
+)
+_MONGO_RANGE_OPERATORS = {
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$ne",
+    "$nin",
+    "$regex",
+    "$not",
+    "$geoWithin",
+    "$geoIntersects",
+}
+_MONGO_EQUALITY_OPERATORS = {"$eq", "$in"}
 
 
 def recommendations_for_query(
@@ -40,40 +78,71 @@ def _dedupe(values: Iterable[str]) -> list[str]:
     return result
 
 
+def mongo_operation_for_query(query_text: str, namespace: Optional[str] = None) -> str:
+    command = _parse_json_object(query_text)
+    if not command:
+        return "Unknown"
+    return _mongo_command_parts(command, namespace).operation
+
+
+def mongo_collection_for_query(query_text: str, namespace: Optional[str] = None) -> str:
+    command = _parse_json_object(query_text)
+    if not command:
+        return _collection_from_ns(namespace)
+    return _mongo_command_parts(command, namespace).collection
+
+
 def _mongodb_recommendations(query_text: str, namespace: Optional[str]) -> list[Recommendation]:
     recommendations: list[Recommendation] = []
     command = _parse_json_object(query_text)
 
     if command:
-        collection, filter_fields, sort_fields, has_or = _mongo_command_parts(command, namespace)
-        index_fields = _dedupe(filter_fields + sort_fields)
-        if index_fields:
+        parts = _mongo_command_parts(command, namespace)
+        esr_keys = _mongo_esr_index_keys(parts)
+        if esr_keys:
             recommendations.append(
                 Recommendation(
                     priority="High",
                     category="Index",
-                    title="Create or verify a compound index for the main filter shape",
+                    title="Create or verify an ESR compound index",
                     rationale=(
-                        "The repeated query filters on these fields. A compound index can reduce "
-                        "documents examined when the fields match the common production predicate."
+                        "This query shape has equality, sort, or range predicates. Apply MongoDB's "
+                        "ESR guideline: equality fields first, sort fields next, and range fields last. "
+                        "If a range predicate is highly selective, compare the ESR index against an ERS "
+                        "variant with explain output before applying it."
                     ),
-                    example=_mongo_index_example(collection, index_fields),
+                    example=_mongo_index_example(parts.collection, esr_keys),
                 )
             )
-        if sort_fields:
+        if parts.sort_fields:
             recommendations.append(
                 Recommendation(
                     priority="Medium",
                     category="Index",
-                    title="Include sort keys after selective filter fields",
+                    title="Validate sort coverage in the compound index",
                     rationale=(
-                        "MongoDB can avoid an in-memory sort when a compound index matches the "
-                        "filter prefix and the requested sort order."
+                        "A sort can be served from the index when the preceding index keys are satisfied "
+                        "by equality predicates and the sort keys appear in the same order and direction."
                     ),
-                    example=_mongo_index_example(collection, _dedupe(filter_fields + sort_fields)),
+                    example=_mongo_index_example(parts.collection, esr_keys),
                 )
             )
-        if has_or:
+        if parts.range_fields and parts.sort_fields:
+            ers_keys = _mongo_ers_index_keys(parts)
+            recommendations.append(
+                Recommendation(
+                    priority="Low",
+                    category="Plan review",
+                    title="Compare ESR with an ERS variant if the range is highly selective",
+                    rationale=(
+                        "MongoDB's ESR guidance keeps sort fields before range fields to avoid in-memory "
+                        "sorts. If the range predicate dramatically reduces the result set, an equality, "
+                        "range, sort order can sometimes win; verify both with executionStats."
+                    ),
+                    example=_mongo_index_example(parts.collection, ers_keys),
+                )
+            )
+        if parts.has_or:
             recommendations.append(
                 Recommendation(
                     priority="Medium",
@@ -83,6 +152,60 @@ def _mongodb_recommendations(query_text: str, namespace: Optional[str]) -> list[
                         "`$or` queries can use indexes per branch. A missing branch index often "
                         "turns the whole shape into a high-scan query."
                     ),
+                )
+            )
+        if parts.empty_filter and parts.operation in {"Find", "Count", "Update", "Delete", "FindAndModify"}:
+            recommendations.append(
+                Recommendation(
+                    priority="High" if parts.operation in {"Update", "Delete", "FindAndModify"} else "Medium",
+                    category="Query rewrite",
+                    title="Add a selective predicate or confirm the full-collection operation is intentional",
+                    rationale=(
+                        f"This {parts.operation} command has no selective filter in the log shape. "
+                        "For hot paths, add an indexed predicate; for maintenance jobs, keep it isolated "
+                        "from latency-sensitive traffic and validate the plan."
+                    ),
+                    example=_mongo_selective_predicate_example(parts),
+                )
+            )
+        if parts.operation == "Insert":
+            recommendations.append(
+                Recommendation(
+                    priority="Low",
+                    category="Index",
+                    title="Review write overhead from secondary indexes",
+                    rationale=(
+                        "Insert commands do not benefit from a predicate index. For write-heavy collections, "
+                        "remove duplicate or unused secondary indexes because every insert must maintain them."
+                    ),
+                )
+            )
+        if parts.aggregate_match_after_blocking:
+            recommendations.append(
+                Recommendation(
+                    priority="High",
+                    category="Query rewrite",
+                    title="Move `$match` before blocking aggregation stages when semantics allow",
+                    rationale=(
+                        "The pipeline has a `$match` after `$sort`, `$group`, `$lookup`, `$unwind`, or "
+                        "`$project`. Push filters earlier when they reference original fields so fewer "
+                        "documents reach expensive stages."
+                    ),
+                    example=_mongo_match_first_example(parts.collection),
+                )
+            )
+        elif parts.operation == "Aggregate" and not parts.aggregate_has_match:
+            recommendations.append(
+                Recommendation(
+                    priority="Medium",
+                    category="Query rewrite",
+                    title="Add an early `$match` stage if the aggregation does not need the full collection",
+                    rationale=(
+                        "Aggregation pipelines that start from the full collection can be expensive. "
+                        "Use an early indexed `$match` for user, tenant, time-window, or status filters "
+                        "when the business result permits it."
+                    ),
+                    example=_mongo_match_first_example(parts.collection),
                 )
             )
 
@@ -139,35 +262,97 @@ def _parse_json_object(text: str) -> Optional[dict[str, Any]]:
 def _mongo_command_parts(
     command: dict[str, Any],
     namespace: Optional[str],
-) -> tuple[str, list[str], list[str], bool]:
-    collection = str(command.get("find") or command.get("aggregate") or _collection_from_ns(namespace))
-    filter_fields: list[str] = []
-    sort_fields: list[str] = []
-    has_or = False
+) -> MongoCommandParts:
+    operation_key, operation = _mongo_operation(command)
+    collection = str(command.get(operation_key) or _collection_from_ns(namespace))
+    parts = MongoCommandParts(
+        operation=operation,
+        collection=collection,
+        equality_fields=[],
+        range_fields=[],
+        sort_fields=[],
+    )
 
-    if isinstance(command.get("filter"), dict):
-        fields, branch_has_or = _mongo_filter_fields(command["filter"])
-        filter_fields.extend(fields)
-        has_or = has_or or branch_has_or
+    if operation in {"Find", "Count", "Distinct", "Unknown"}:
+        _extend_filter_parts(parts, command.get("filter") or command.get("query"))
+        _extend_sort_parts(parts, command.get("sort"))
+        if operation == "Distinct" and isinstance(command.get("key"), str):
+            parts.equality_fields.append(command["key"])
 
-    if isinstance(command.get("sort"), dict):
-        sort_fields.extend(command["sort"].keys())
+    if operation == "Update":
+        updates = command.get("updates")
+        if isinstance(updates, list):
+            for update_spec in updates:
+                if isinstance(update_spec, dict):
+                    _extend_filter_parts(parts, update_spec.get("q"))
+                    _extend_sort_parts(parts, update_spec.get("sort"))
+        else:
+            _extend_filter_parts(parts, command.get("q") or command.get("query") or command.get("filter"))
+
+    if operation == "Delete":
+        deletes = command.get("deletes")
+        if isinstance(deletes, list):
+            for delete_spec in deletes:
+                if isinstance(delete_spec, dict):
+                    _extend_filter_parts(parts, delete_spec.get("q"))
+        else:
+            _extend_filter_parts(parts, command.get("q") or command.get("query") or command.get("filter"))
+
+    if operation == "FindAndModify":
+        _extend_filter_parts(parts, command.get("query") or command.get("filter"))
+        _extend_sort_parts(parts, command.get("sort"))
 
     pipeline = command.get("pipeline")
     if isinstance(pipeline, list):
+        blocking_stage_seen = False
         for stage in pipeline:
             if not isinstance(stage, dict):
                 continue
             match_stage = stage.get("$match")
             if isinstance(match_stage, dict):
-                fields, branch_has_or = _mongo_filter_fields(match_stage)
-                filter_fields.extend(fields)
-                has_or = has_or or branch_has_or
+                parts.aggregate_has_match = True
+                if blocking_stage_seen:
+                    parts.aggregate_match_after_blocking = True
+                _extend_filter_parts(parts, match_stage)
             sort_stage = stage.get("$sort")
             if isinstance(sort_stage, dict):
-                sort_fields.extend(sort_stage.keys())
+                _extend_sort_parts(parts, sort_stage)
+            if any(key in stage for key in {"$sort", "$group", "$lookup", "$unwind", "$project"}):
+                blocking_stage_seen = True
 
-    return collection, _dedupe(filter_fields), _dedupe(sort_fields), has_or
+    parts.equality_fields = _dedupe(parts.equality_fields)
+    parts.range_fields = _dedupe(parts.range_fields)
+    parts.sort_fields = _dedupe_index_keys(parts.sort_fields)
+    if (
+        operation in {"Find", "Count", "Distinct", "Update", "Delete", "FindAndModify"}
+        and not parts.equality_fields
+        and not parts.range_fields
+    ):
+        parts.empty_filter = True
+    return parts
+
+
+def _mongo_operation(command: dict[str, Any]) -> tuple[str, str]:
+    for key, label in _MONGO_OPERATION_KEYS:
+        if key in command:
+            return key, label
+    return "", "Unknown"
+
+
+def _extend_filter_parts(parts: MongoCommandParts, filter_doc: Any) -> None:
+    if not isinstance(filter_doc, dict):
+        return
+    equality_fields, range_fields, has_or, has_regex = _mongo_filter_fields(filter_doc)
+    parts.equality_fields.extend(equality_fields)
+    parts.range_fields.extend(range_fields)
+    parts.has_or = parts.has_or or has_or
+    parts.has_regex = parts.has_regex or has_regex
+
+
+def _extend_sort_parts(parts: MongoCommandParts, sort_doc: Any) -> None:
+    if not isinstance(sort_doc, dict):
+        return
+    parts.sort_fields.extend(_mongo_sort_fields(sort_doc))
 
 
 def _collection_from_ns(namespace: Optional[str]) -> str:
@@ -177,38 +362,144 @@ def _collection_from_ns(namespace: Optional[str]) -> str:
     return parts[1] if len(parts) == 2 else namespace
 
 
-def _mongo_filter_fields(filter_doc: dict[str, Any], prefix: str = "") -> tuple[list[str], bool]:
-    fields: list[str] = []
+def _mongo_filter_fields(filter_doc: dict[str, Any], prefix: str = "") -> tuple[list[str], list[str], bool, bool]:
+    equality_fields: list[str] = []
+    range_fields: list[str] = []
     has_or = False
+    has_regex = False
     for key, value in filter_doc.items():
         if key in {"$or", "$and", "$nor"}:
             has_or = has_or or key == "$or"
             if isinstance(value, list):
                 for branch in value:
                     if isinstance(branch, dict):
-                        branch_fields, branch_has_or = _mongo_filter_fields(branch, prefix)
-                        fields.extend(branch_fields)
+                        branch_equalities, branch_ranges, branch_has_or, branch_has_regex = _mongo_filter_fields(
+                            branch,
+                            prefix,
+                        )
+                        equality_fields.extend(branch_equalities)
+                        range_fields.extend(branch_ranges)
                         has_or = has_or or branch_has_or
+                        has_regex = has_regex or branch_has_regex
             continue
         if key.startswith("$"):
             continue
 
         dotted_key = f"{prefix}.{key}" if prefix else key
-        fields.append(dotted_key)
+        if isinstance(value, dict):
+            operator_keys = {child_key for child_key in value if child_key.startswith("$")}
+            if operator_keys:
+                if operator_keys & _MONGO_EQUALITY_OPERATORS:
+                    equality_fields.append(dotted_key)
+                if operator_keys & _MONGO_RANGE_OPERATORS:
+                    range_fields.append(dotted_key)
+                if "$regex" in operator_keys:
+                    has_regex = True
+                if not (operator_keys & _MONGO_EQUALITY_OPERATORS) and not (operator_keys & _MONGO_RANGE_OPERATORS):
+                    range_fields.append(dotted_key)
+            else:
+                nested_equalities, nested_ranges, nested_has_or, nested_has_regex = _mongo_filter_fields(
+                    value,
+                    dotted_key,
+                )
+                if nested_equalities or nested_ranges:
+                    equality_fields.extend(nested_equalities)
+                else:
+                    equality_fields.append(dotted_key)
+                range_fields.extend(nested_ranges)
+                has_or = has_or or nested_has_or
+                has_regex = has_regex or nested_has_regex
+        else:
+            equality_fields.append(dotted_key)
 
-        if isinstance(value, dict) and not any(child_key.startswith("$") for child_key in value):
-            nested_fields, nested_has_or = _mongo_filter_fields(value, dotted_key)
-            fields.extend(nested_fields)
-            has_or = has_or or nested_has_or
-
-    return _dedupe(fields), has_or
+    return _dedupe(equality_fields), _dedupe(range_fields), has_or, has_regex
 
 
-def _mongo_index_example(collection: str, fields: list[str]) -> str:
+def _mongo_sort_fields(sort_doc: dict[str, Any]) -> list[tuple[str, str]]:
+    fields: list[tuple[str, str]] = []
+    for field, direction in sort_doc.items():
+        fields.append((str(field), _normalize_mongo_index_direction(direction)))
+    return fields
+
+
+def _mongo_esr_index_keys(parts: MongoCommandParts) -> list[tuple[str, str]]:
+    keys = [(field, "1") for field in parts.equality_fields]
+    keys.extend(parts.sort_fields)
+    keys.extend((field, "1") for field in parts.range_fields)
+    return _dedupe_index_keys(keys)
+
+
+def _mongo_ers_index_keys(parts: MongoCommandParts) -> list[tuple[str, str]]:
+    keys = [(field, "1") for field in parts.equality_fields]
+    keys.extend((field, "1") for field in parts.range_fields)
+    keys.extend(parts.sort_fields)
+    return _dedupe_index_keys(keys)
+
+
+def _dedupe_index_keys(keys: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for field, direction in keys:
+        clean_field = field.strip().strip("`\"")
+        if not clean_field or clean_field in seen:
+            continue
+        seen.add(clean_field)
+        result.append((clean_field, direction))
+    return result
+
+
+def _normalize_mongo_index_direction(direction: Any) -> str:
+    if isinstance(direction, float) and direction.is_integer():
+        direction = int(direction)
+    if direction in {-1, "-1", "desc", "DESC"}:
+        return "-1"
+    if direction in {1, "1", "asc", "ASC"}:
+        return "1"
+    return str(direction)
+
+
+def _format_mongo_index_direction(direction: str) -> str:
+    if direction in {"1", "-1"}:
+        return direction
+    return json.dumps(direction)
+
+
+def _mongo_index_example(collection: str, fields: list[str] | list[tuple[str, str]]) -> str:
     if not fields:
         fields = ["<field>"]
-    key_spec = ", ".join(f'"{field}": 1' for field in fields)
+    index_fields: list[tuple[str, str]] = []
+    for field in fields:
+        if isinstance(field, tuple):
+            index_fields.append(field)
+        else:
+            index_fields.append((field, "1"))
+    key_spec = ", ".join(
+        f'"{field}": {_format_mongo_index_direction(direction)}'
+        for field, direction in _dedupe_index_keys(index_fields)
+    )
     return f'db.getCollection("{collection or "<collection>"}").createIndex({{{key_spec}}})'
+
+
+def _mongo_match_first_example(collection: str) -> str:
+    return (
+        f'db.getCollection("{collection or "<collection>"}").aggregate(['
+        '{"$match": {"<selectiveField>": "<value>"}}, '
+        '"<remaining pipeline stages>"'
+        "])"
+    )
+
+
+def _mongo_selective_predicate_example(parts: MongoCommandParts) -> str:
+    collection = parts.collection or "<collection>"
+    if parts.operation == "Aggregate":
+        return _mongo_match_first_example(collection)
+    if parts.operation == "Update":
+        return f'db.getCollection("{collection}").updateOne({{"<selectiveField>": "<value>"}}, {{"$set": {{"<field>": "<value>"}}}})'
+    if parts.operation == "Delete":
+        return f'db.getCollection("{collection}").deleteOne({{"<selectiveField>": "<value>"}})'
+    if parts.operation == "Count":
+        return f'db.getCollection("{collection}").countDocuments({{"<selectiveField>": "<value>"}})'
+    return f'db.getCollection("{collection}").find({{"<selectiveField>": "<value>"}}).limit(100)'
 
 
 def _sql_recommendations(db_type: str, query_text: str) -> list[Recommendation]:

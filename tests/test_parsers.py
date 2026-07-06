@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from src.parsers import parse_mongodb_logs
+from src.parsers import normalize_query, parse_mongodb_logs
 
 
 class MongoDBParserTests(unittest.TestCase):
@@ -98,6 +98,53 @@ class MongoDBParserTests(unittest.TestCase):
         self.assertEqual(events[0].namespace, "prod.stories")
         self.assertEqual(events[0].plan_summary, "COLLSCAN")
         self.assertEqual(events[0].duration_ms, 1200)
+
+    def test_parses_structured_update_command(self):
+        log_line = json.dumps(
+            {
+                "t": {"$date": "2026-06-30T00:55:29.000+00:00"},
+                "msg": "Slow query",
+                "attr": {
+                    "ns": "prod.stories",
+                    "command": {
+                        "update": "stories",
+                        "updates": [
+                            {
+                                "q": {"tenantId": "acme", "status": "draft"},
+                                "u": {"$set": {"status": "published"}},
+                            }
+                        ],
+                        "$db": "prod",
+                    },
+                    "planSummary": "COLLSCAN",
+                    "durationMillis": 980,
+                },
+            }
+        )
+
+        events = parse_mongodb_logs(log_line)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].namespace, "prod.stories")
+        self.assertEqual(events[0].plan_summary, "COLLSCAN")
+        self.assertIn('"update": "stories"', events[0].query)
+
+    def test_mongodb_normalization_preserves_crud_collection_names_and_sort_direction(self):
+        normalized = normalize_query(
+            (
+                '{"aggregate":"stories","pipeline":[{"$match":{"tenantId":"acme"}},'
+                '{"$sort":{"createdAt":-1}}]}'
+            ),
+            "MongoDB",
+        )
+        update_normalized = normalize_query(
+            '{"update":"stories","updates":[{"q":{"tenantId":"acme"},"u":{"$set":{"status":"published"}}}]}',
+            "MongoDB",
+        )
+
+        self.assertIn('"aggregate": "stories"', normalized)
+        self.assertIn('"createdAt": -1', normalized)
+        self.assertIn('"update": "stories"', update_normalized)
 
 
 if __name__ == "__main__":

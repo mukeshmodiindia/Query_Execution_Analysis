@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import Counter
-import json
 from typing import Any, Optional
 
 import pandas as pd
@@ -20,7 +19,11 @@ from src.mongo_indexes import (
     suggested_index_from_example,
 )
 from src.parsers import normalize_query, parser_for
-from src.recommendations import recommendations_for_query
+from src.recommendations import (
+    mongo_collection_for_query,
+    mongo_operation_for_query,
+    recommendations_for_query,
+)
 from src.storage import list_upload_batches, load_upload_events
 from src.version_profiles import VERSION_PROFILES
 
@@ -102,29 +105,39 @@ def _collection_from_namespace(namespace: Optional[str]) -> Optional[str]:
 
 
 def _collection_from_query(query_text: str, namespace: Optional[str]) -> Optional[str]:
-    try:
-        command = json.loads(query_text)
-    except json.JSONDecodeError:
-        return _collection_from_namespace(namespace)
-
-    if not isinstance(command, dict):
-        return _collection_from_namespace(namespace)
-
-    for key in (
-        "find",
-        "aggregate",
-        "count",
-        "distinct",
-        "insert",
-        "update",
-        "delete",
-        "findAndModify",
-        "findandmodify",
-    ):
-        collection = command.get(key)
-        if isinstance(collection, str):
-            return collection
+    collection = mongo_collection_for_query(query_text, namespace)
+    if collection and collection != "<collection>":
+        return collection
     return _collection_from_namespace(namespace)
+
+
+def _mongo_operation_group(operation: str) -> str:
+    if operation == "Aggregate":
+        return "Aggregate"
+    if operation in {"Find", "Count", "Distinct"}:
+        return "CRUD read"
+    if operation in {"Insert", "Update", "Delete", "FindAndModify"}:
+        return "CRUD write"
+    return "Unknown"
+
+
+def _mongodb_explain_command(operation: str, collection: Optional[str], explain_mode: str) -> str:
+    collection_name = collection or "<collection>"
+    explain_call = ".explain()" if explain_mode == "queryPlanner" else f'.explain("{explain_mode}")'
+    prefix = f'db.getCollection("{collection_name}"){explain_call}'
+    if operation == "Aggregate":
+        return f'{prefix}.aggregate([{{"$match": <filter>}}, <pipeline stages>])'
+    if operation == "Count":
+        return f"{prefix}.countDocuments(<filter>)"
+    if operation == "Distinct":
+        return f'{prefix}.distinct("<field>", <filter>)'
+    if operation == "Update":
+        return f'{prefix}.updateOne(<filter>, {{"$set": <update>}})'
+    if operation == "Delete":
+        return f"{prefix}.deleteOne(<filter>)"
+    if operation == "FindAndModify":
+        return f"{prefix}.findAndModify({{query: <filter>, update: <update>}})"
+    return f"{prefix}.find(<filter>)"
 
 
 def _explain_language(db_type: str) -> str:
@@ -315,11 +328,25 @@ df["is_collection_scan"] = (
     df["plan_summary"].str.contains("COLLSCAN", case=False, na=False)
     | df["source_line"].str.contains("COLLSCAN", case=False, na=False)
 )
+if db_type == "MongoDB":
+    df["query_operation"] = df.apply(
+        lambda row: mongo_operation_for_query(
+            str(row["query"]),
+            str(row["namespace"]) if pd.notna(row["namespace"]) else None,
+        ),
+        axis=1,
+    )
+    df["operation_group"] = df["query_operation"].apply(_mongo_operation_group)
+else:
+    df["query_operation"] = ""
+    df["operation_group"] = ""
 
 agg = (
     df.groupby("normalized_query", as_index=False)
     .agg(
         namespace=("namespace", lambda values: next((str(value) for value in values.dropna()), "")),
+        operation=("query_operation", lambda values: next((str(value) for value in values.dropna()), "")),
+        operation_group=("operation_group", lambda values: next((str(value) for value in values.dropna()), "")),
         occurrences=("normalized_query", "count"),
         total_duration_ms=("duration_ms", "sum"),
         avg_duration_ms=("duration_ms", "mean"),
@@ -391,6 +418,7 @@ if db_type == "MongoDB" and agg["collection_scans"].sum() > 0:
 
 review_columns = [
     "collection",
+    "operation",
     "occurrences",
     "collection_scans",
     "collection_scan_rate",
@@ -416,37 +444,88 @@ focus = st.selectbox(
     index=list(focus_options.keys()).index(default_focus),
 )
 
-filter1, filter2, filter3, filter4 = st.columns(4)
+filter1, filter2, filter3, filter4, filter5 = st.columns(5)
 max_occurrences = int(max(1, agg["occurrences"].max()))
+default_min_occ = 2 if focus == "High occurrence" and max_occurrences > 1 else 1
 with filter1:
     min_occ = st.number_input(
         "Minimum occurrences",
         min_value=1,
         max_value=max_occurrences,
-        value=min(2, max_occurrences),
+        value=min(default_min_occ, max_occurrences),
         step=1,
+        key=f"min_occ_{focus}",
     )
 with filter2:
-    min_avg_duration = st.number_input("Minimum average duration (ms)", min_value=0.0, value=0.0, step=10.0)
+    min_avg_duration = st.number_input(
+        "Minimum average duration (ms)",
+        min_value=0.0,
+        value=0.0,
+        step=10.0,
+        key=f"min_avg_duration_{focus}",
+    )
 with filter3:
-    min_max_duration = st.number_input("Minimum max duration (ms)", min_value=0.0, value=0.0, step=10.0)
+    min_max_duration = st.number_input(
+        "Minimum max duration (ms)",
+        min_value=0.0,
+        value=0.0,
+        step=10.0,
+        key=f"min_max_duration_{focus}",
+    )
 with filter4:
-    analysis_limit = st.number_input("Queries to analyze", min_value=1, max_value=50, value=10, step=1)
+    analysis_limit = st.number_input(
+        "Queries to analyze",
+        min_value=1,
+        max_value=50,
+        value=10,
+        step=1,
+        key=f"analysis_limit_{focus}",
+    )
+with filter5:
+    operation_filter = "All"
+    if db_type == "MongoDB":
+        operation_filter = st.selectbox(
+            "Mongo operation",
+            [
+                "All",
+                "CRUD read",
+                "CRUD write",
+                "Aggregate",
+                "Find",
+                "Count",
+                "Distinct",
+                "Insert",
+                "Update",
+                "Delete",
+                "FindAndModify",
+                "Unknown",
+            ],
+            key=f"mongo_operation_filter_{focus}",
+        )
 
 only_collection_scans = False
 if db_type == "MongoDB":
-    only_collection_scans = st.checkbox("Only queries with collection scans", value=focus == "Collection scan")
+    only_collection_scans = st.checkbox(
+        "Only queries with collection scans",
+        value=focus == "Collection scan",
+        key=f"only_collection_scans_{focus}",
+    )
 
 filtered_queries = agg[
     (agg["occurrences"] >= min_occ)
     & (agg["avg_duration_ms"] >= min_avg_duration)
     & (agg["max_duration_ms"] >= min_max_duration)
 ].copy()
+if db_type == "MongoDB" and operation_filter != "All":
+    if operation_filter in {"CRUD read", "CRUD write", "Aggregate"}:
+        filtered_queries = filtered_queries[filtered_queries["operation_group"] == operation_filter]
+    else:
+        filtered_queries = filtered_queries[filtered_queries["operation"] == operation_filter]
 if only_collection_scans:
     filtered_queries = filtered_queries[filtered_queries["collection_scans"] > 0]
 
 if filtered_queries.empty:
-    st.warning("No query meets the selected occurrence, collection scan, and duration filters.")
+    st.warning("No query meets the selected operation, occurrence, collection scan, and duration filters.")
     st.stop()
 
 rank_columns = focus_options[focus]
@@ -477,6 +556,7 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
     representative_query = sample_originals[0][0] if sample_originals else query_text
     namespace = _first_namespace(query_df)
     collection = str(selected.get("collection") or "") or _collection_from_query(representative_query, namespace)
+    operation = str(selected.get("operation") or "") or mongo_operation_for_query(representative_query, namespace)
     plan_summaries = [str(value) for value in query_df["plan_summary"].dropna().unique() if str(value).strip()]
 
     with st.container(border=True):
@@ -490,6 +570,7 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
         m5.metric("Collection scans", int(selected.get("collection_scans", 0)))
         if db_type == "MongoDB":
             st.write(
+                f"Operation: `{operation or 'Unknown'}` | "
                 f"Collection: `{collection or '<unknown>'}` | "
                 f"Collection scan rate: `{selected.get('collection_scan_rate', 0):.1f}%`"
             )
@@ -567,14 +648,10 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
 
         if db_type == "MongoDB":
             st.markdown("**Run in Mongo shell / mongosh**")
-            mode_for_call = explain_mode if explain_mode != "queryPlanner" else None
-            if mode_for_call:
-                st.code(
-                    f"db.<collection>.explain('{mode_for_call}').find(<filter>)",
-                    language="javascript",
-                )
-            else:
-                st.code("db.<collection>.explain().find(<filter>)", language="javascript")
+            st.code(
+                _mongodb_explain_command(operation, collection, explain_mode),
+                language="javascript",
+            )
             st.write("Expected output fields to inspect:")
             st.json(
                 {
@@ -600,7 +677,14 @@ for rank, (_, selected) in enumerate(page_queries.iterrows(), start=start_idx + 
         st.markdown("#### Index & Sample Data Checklist")
         if db_type == "MongoDB":
             st.code("db.<collection>.getIndexes()", language="javascript")
-            st.code("db.<collection>.find(<filter>).limit(5)", language="javascript")
+            if operation == "Aggregate":
+                st.code('db.<collection>.aggregate([{"$match": <filter>}, <pipeline stages>]).limit(5)', language="javascript")
+            elif operation in {"Update", "Delete", "FindAndModify"}:
+                st.code("db.<collection>.find(<same filter>).limit(5)", language="javascript")
+            elif operation == "Insert":
+                st.code("db.<collection>.estimatedDocumentCount()", language="javascript")
+            else:
+                st.code("db.<collection>.find(<filter>).limit(5)", language="javascript")
             st.markdown(
                 "Share existing index definitions, estimated document count/cardinality for filtered fields, "
                 "and a few representative documents before applying index changes."
